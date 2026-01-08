@@ -142,6 +142,11 @@ class BlockPool:
             actual block size can be a multiple of hash_block_size.
         enable_kv_cache_events: Whether to enable kv cache events.
         metrics_collector: Optional metrics collector for tracking block residency.
+        enable_deferred_release: Whether to enable deferred release mechanism.
+            When enabled, freed blocks are buffered and merged when allocation
+            fails, reducing fragmentation and improving KV offload efficiency.
+        enable_coalescing: Whether to sort blocks by block_id when merging
+            from release cache to coalesce adjacent free regions.
     """
 
     def __init__(
@@ -151,11 +156,16 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        enable_deferred_release: bool = False,
+        enable_coalescing: bool = True,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
+        self.enable_deferred_release = enable_deferred_release
+        self.enable_coalescing = enable_coalescing
+
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
@@ -163,7 +173,11 @@ class BlockPool:
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
         # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        self.free_block_queue = FreeKVCacheBlockQueue(
+            self.blocks,
+            enable_deferred_release=enable_deferred_release,
+            enable_coalescing=enable_coalescing,
+        )
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
@@ -389,6 +403,10 @@ class BlockPool:
         """Free a list of blocks. The blocks should be ordered by their
         eviction priority, where the first block will be evicted first.
 
+        When deferred release is enabled, blocks are buffered in a release
+        cache instead of immediately added to the free pool. This reduces
+        fragmentation and improves allocation efficiency.
+
         Args:
             ordered_blocks: A list of blocks to free ordered by their eviction
                 priority.
@@ -397,9 +415,36 @@ class BlockPool:
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
-        self.free_block_queue.append_n(
-            [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
-        )
+
+        freed_blocks = [
+            block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
+        ]
+
+        if self.enable_deferred_release:
+            # Use deferred release: buffer blocks in release cache
+            self.free_block_queue.deferred_free_n(freed_blocks)
+        else:
+            # Immediate release: add directly to free pool
+            self.free_block_queue.append_n(freed_blocks)
+
+    def free_blocks_deferred(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+        """Free blocks using deferred release, regardless of global setting.
+
+        This is useful when you want to explicitly use deferred release for
+        specific operations like batch preemption or KV offload preparation.
+
+        Args:
+            ordered_blocks: A list of blocks to free ordered by their eviction
+                priority.
+        """
+        blocks_list = list(ordered_blocks)
+        for block in blocks_list:
+            block.ref_cnt -= 1
+
+        freed_blocks = [
+            block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
+        ]
+        self.free_block_queue.deferred_free_n(freed_blocks)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -458,10 +503,97 @@ class BlockPool:
     def get_num_free_blocks(self) -> int:
         """Get the number of free blocks in the pool.
 
+        When deferred release is enabled, this includes both the free pool
+        and the release cache to give an accurate count of available blocks.
+
         Returns:
             The number of free blocks.
         """
+        if self.enable_deferred_release:
+            return self.free_block_queue.get_total_available_blocks()
         return self.free_block_queue.num_free_blocks
+
+    def get_num_free_blocks_in_pool(self) -> int:
+        """Get the number of free blocks only in the free pool (not release cache).
+
+        Returns:
+            The number of free blocks in the free pool.
+        """
+        return self.free_block_queue.num_free_blocks
+
+    def get_num_blocks_in_release_cache(self) -> int:
+        """Get the number of blocks in the release cache.
+
+        Returns:
+            The number of blocks in the release cache.
+        """
+        return self.free_block_queue.release_cache_size
+
+    def merge_release_cache(self) -> int:
+        """Force merge all blocks from release cache to free pool.
+
+        This is useful for:
+        1. KV offload operations that need contiguous memory regions
+        2. Debugging and testing
+        3. Explicit control over when merging happens
+
+        Returns:
+            The number of blocks merged.
+        """
+        return self.free_block_queue.merge_release_cache()
+
+    def get_new_blocks_with_merge(self, num_blocks: int) -> list[KVCacheBlock] | None:
+        """Try to get new blocks, merging release cache if needed.
+
+        This is the deferred-release-aware version of get_new_blocks().
+        When the free pool doesn't have enough blocks, it will merge
+        blocks from the release cache (sorted by block_id for locality)
+        and retry the allocation.
+
+        Args:
+            num_blocks: The number of blocks to allocate.
+
+        Returns:
+            A list of blocks if successful, None if not enough blocks.
+        """
+        if not self.enable_deferred_release:
+            # Fall back to regular allocation
+            if num_blocks > self.get_num_free_blocks():
+                return None
+            return self.get_new_blocks(num_blocks)
+
+        # Try to allocate with merge
+        ret = self.free_block_queue.try_allocate_with_merge(num_blocks)
+        if ret is None:
+            return None
+
+        # Process allocated blocks (eviction and ref_cnt)
+        if self.enable_caching:
+            for block in ret:
+                self._maybe_evict_cached_block(block)
+                assert block.ref_cnt == 0
+                block.ref_cnt += 1
+                if self.metrics_collector:
+                    self.metrics_collector.on_block_allocated(block)
+        else:
+            for block in ret:
+                assert block.ref_cnt == 0
+                block.ref_cnt += 1
+                if self.metrics_collector:
+                    self.metrics_collector.on_block_allocated(block)
+        return ret
+
+    def get_contiguous_free_ranges(self) -> list[tuple[int, int]]:
+        """Get ranges of contiguous free block IDs.
+
+        This is useful for KV offload operations to identify contiguous
+        memory regions that can be transferred efficiently via DMA.
+
+        Returns:
+            A list of (start_block_id, length) tuples representing
+            contiguous ranges of free blocks.
+        """
+        return self.free_block_queue.get_contiguous_free_ranges()
 
     def get_usage(self) -> float:
         """Get the KV cache usage.

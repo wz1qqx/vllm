@@ -153,6 +153,73 @@ class KVCacheBlock:
         )
 
 
+class ReleaseCache:
+    """A temporary buffer for freed blocks before they are merged into the
+    free pool.
+
+    This class implements a deferred release mechanism where freed blocks are
+    first buffered here instead of immediately being added to the free pool.
+    When an allocation request cannot be satisfied by the current free pool,
+    the allocator will merge the buffered blocks with the free pool, sort them
+    by block_id, and retry the allocation.
+
+    Benefits:
+    1. Reduces allocation contention during high-concurrency operations
+    2. Mitigates memory fragmentation by coalescing adjacent free regions
+    3. Improves KV offload transfer efficiency by maintaining block locality
+
+    Args:
+        enable_coalescing: Whether to sort blocks by block_id when merging
+            to coalesce adjacent free regions. Default is True.
+    """
+
+    def __init__(self, enable_coalescing: bool = True) -> None:
+        self._buffer: list[KVCacheBlock] = []
+        self.enable_coalescing = enable_coalescing
+
+    def add(self, block: KVCacheBlock) -> None:
+        """Add a single block to the release cache."""
+        self._buffer.append(block)
+
+    def add_batch(self, blocks: Iterable[KVCacheBlock]) -> None:
+        """Add multiple blocks to the release cache."""
+        self._buffer.extend(blocks)
+
+    def pop_all(self) -> list[KVCacheBlock]:
+        """Pop all blocks from the release cache.
+
+        If coalescing is enabled, blocks are sorted by block_id to help
+        coalesce adjacent free regions when merged into the free pool.
+
+        Returns:
+            A list of all buffered blocks, potentially sorted by block_id.
+        """
+        if not self._buffer:
+            return []
+
+        blocks = self._buffer
+        self._buffer = []
+
+        if self.enable_coalescing:
+            # Sort by block_id to coalesce adjacent free regions
+            # This improves memory locality for KV offload operations
+            blocks.sort(key=lambda b: b.block_id)
+
+        return blocks
+
+    def __len__(self) -> int:
+        return len(self._buffer)
+
+    @property
+    def num_blocks(self) -> int:
+        """Number of blocks currently in the release cache."""
+        return len(self._buffer)
+
+    def clear(self) -> None:
+        """Clear all blocks from the release cache without returning them."""
+        self._buffer.clear()
+
+
 class FreeKVCacheBlockQueue:
     """This class organizes a list of KVCacheBlock objects to a doubly linked
     list of free blocks. We implement this class instead of using Python
@@ -173,10 +240,24 @@ class FreeKVCacheBlockQueue:
 
     Args:
         blocks: A list of KVCacheBlock objects.
+        enable_deferred_release: Whether to enable deferred release mechanism.
+            When enabled, freed blocks are buffered in a release cache and
+            merged back when allocation fails. Default is False.
+        enable_coalescing: Whether to sort blocks by block_id when merging
+            from release cache to coalesce adjacent free regions. Default is True.
     """
 
-    def __init__(self, blocks: list[KVCacheBlock]) -> None:
+    def __init__(
+        self,
+        blocks: list[KVCacheBlock],
+        enable_deferred_release: bool = False,
+        enable_coalescing: bool = True,
+    ) -> None:
         self.num_free_blocks = len(blocks)
+        self.enable_deferred_release = enable_deferred_release
+
+        # Release cache for deferred release mechanism
+        self._release_cache = ReleaseCache(enable_coalescing=enable_coalescing)
 
         # Initialize doubly links of consecutive blocks
         for i in range(self.num_free_blocks):
@@ -362,6 +443,190 @@ class FreeKVCacheBlockQueue:
             ret.append(curr_block)
             curr_block = curr_block.next_free_block
         return ret
+
+    # ==================== Deferred Release Methods ====================
+
+    def deferred_free(self, block: KVCacheBlock) -> None:
+        """Add a block to the release cache instead of immediately freeing it.
+
+        This is the deferred release version of append(). The block is buffered
+        in the release cache and will be merged back into the free pool later.
+
+        Args:
+            block: The block to defer release.
+        """
+        if self.enable_deferred_release:
+            self._release_cache.add(block)
+        else:
+            # Fall back to immediate release
+            self.append(block)
+            self.num_free_blocks += 1
+
+    def deferred_free_n(self, blocks: list[KVCacheBlock]) -> None:
+        """Add multiple blocks to the release cache.
+
+        This is the deferred release version of append_n(). Blocks are buffered
+        in the release cache and will be merged back into the free pool later.
+
+        Args:
+            blocks: The blocks to defer release.
+        """
+        if not blocks:
+            return
+
+        if self.enable_deferred_release:
+            self._release_cache.add_batch(blocks)
+        else:
+            # Fall back to immediate release
+            self.append_n(blocks)
+
+    def merge_release_cache(self) -> int:
+        """Merge all blocks from the release cache into the free pool.
+
+        When coalescing is enabled, blocks are sorted by block_id before
+        being added to the free pool. This helps to maintain memory locality
+        and reduces fragmentation.
+
+        Returns:
+            The number of blocks merged from the release cache.
+        """
+        blocks = self._release_cache.pop_all()
+        if not blocks:
+            return 0
+
+        # When coalescing is enabled, blocks are already sorted by block_id
+        # We prepend them to the free list to maintain sorted order at the front
+        if self._release_cache.enable_coalescing:
+            self._prepend_sorted_blocks(blocks)
+        else:
+            self.append_n(blocks)
+
+        return len(blocks)
+
+    def _prepend_sorted_blocks(self, blocks: list[KVCacheBlock]) -> None:
+        """Prepend sorted blocks to the front of the free list.
+
+        This maintains block locality at the front of the queue, which is
+        beneficial for KV offload operations that prefer contiguous memory.
+
+        Args:
+            blocks: A list of blocks sorted by block_id.
+        """
+        if not blocks:
+            return
+
+        # Get the current first block (or fake_tail if empty)
+        first_block = self.fake_free_list_head.next_free_block
+        assert first_block is not None
+
+        # Build the chain for the new blocks
+        prev = self.fake_free_list_head
+        for block in blocks:
+            prev.next_free_block = block
+            block.prev_free_block = prev
+            prev = block
+
+        # Connect the last new block to the original first block
+        prev.next_free_block = first_block
+        first_block.prev_free_block = prev
+
+        self.num_free_blocks += len(blocks)
+
+    def try_allocate_with_merge(self, n: int) -> list[KVCacheBlock] | None:
+        """Try to allocate n blocks, merging release cache if needed.
+
+        This method first checks if the free pool has enough blocks. If not,
+        it merges the release cache and retries. This is the core of the
+        deferred release mechanism.
+
+        Args:
+            n: The number of blocks to allocate.
+
+        Returns:
+            A list of n blocks if successful, None if not enough blocks
+            even after merging the release cache.
+        """
+        total_available = self.num_free_blocks + self._release_cache.num_blocks
+
+        if n > total_available:
+            # Not enough blocks even after merging
+            return None
+
+        if n <= self.num_free_blocks:
+            # Enough blocks in the free pool, no need to merge
+            return self.popleft_n(n)
+
+        # Need to merge release cache first
+        self.merge_release_cache()
+
+        if n <= self.num_free_blocks:
+            return self.popleft_n(n)
+
+        # Should not reach here if total_available >= n
+        return None
+
+    def get_total_available_blocks(self) -> int:
+        """Get the total number of available blocks (free pool + release cache).
+
+        Returns:
+            Total number of blocks available for allocation.
+        """
+        return self.num_free_blocks + self._release_cache.num_blocks
+
+    @property
+    def release_cache_size(self) -> int:
+        """Get the number of blocks in the release cache."""
+        return self._release_cache.num_blocks
+
+    def force_merge(self) -> int:
+        """Force merge all blocks from release cache to free pool.
+
+        This is useful for scenarios like KV offload where we want to
+        consolidate all free blocks for efficient batch transfer.
+
+        Returns:
+            The number of blocks merged.
+        """
+        return self.merge_release_cache()
+
+    def get_contiguous_free_ranges(self) -> list[tuple[int, int]]:
+        """Get ranges of contiguous free block IDs.
+
+        This is useful for KV offload operations to identify contiguous
+        memory regions that can be transferred efficiently.
+
+        Returns:
+            A list of (start_block_id, length) tuples representing
+            contiguous ranges of free blocks.
+        """
+        # First merge any pending releases to get accurate picture
+        self.merge_release_cache()
+
+        free_blocks = self.get_all_free_blocks()
+        if not free_blocks:
+            return []
+
+        # Sort by block_id
+        free_blocks.sort(key=lambda b: b.block_id)
+
+        ranges: list[tuple[int, int]] = []
+        range_start = free_blocks[0].block_id
+        prev_id = range_start
+
+        for block in free_blocks[1:]:
+            if block.block_id == prev_id + 1:
+                # Continue the current range
+                prev_id = block.block_id
+            else:
+                # End the current range and start a new one
+                ranges.append((range_start, prev_id - range_start + 1))
+                range_start = block.block_id
+                prev_id = range_start
+
+        # Don't forget the last range
+        ranges.append((range_start, prev_id - range_start + 1))
+
+        return ranges
 
 
 def need_extra_keys(request: Request) -> bool:

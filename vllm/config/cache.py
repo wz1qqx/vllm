@@ -159,6 +159,23 @@ class CacheConfig:
     'native' (vLLM native CPU offloading), 'lmcache' This option must be used
     together with kv_offloading_size."""
 
+    enable_deferred_release: bool = False
+    """Enable deferred release mechanism for KV cache blocks.
+    When enabled, freed blocks are buffered in a temporary cache instead of
+    immediately being added to the free pool. When an allocation request cannot
+    be satisfied by the current free pool alone, the allocator will merge the
+    buffered blocks with the free pool, sort them by block_id, and retry.
+    This design reduces allocation contention and fragmentation during
+    high-concurrency operations, and improves KV offload transfer efficiency
+    by maintaining block locality."""
+
+    enable_block_coalescing: bool = True
+    """Enable block coalescing when merging release cache.
+    When enabled (and enable_deferred_release is True), blocks are sorted by
+    block_id when merged from the release cache to the free pool. This helps
+    coalesce adjacent free regions, reducing memory fragmentation and improving
+    DMA transfer efficiency for KV offload operations."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -186,6 +203,9 @@ class CacheConfig:
             "num_cpu_blocks",
             # WIP feature toggle not impacting compiled graph shape
             "kv_sharing_fast_prefill",
+            # Deferred release settings don't affect graph shape
+            "enable_deferred_release",
+            "enable_block_coalescing",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors
