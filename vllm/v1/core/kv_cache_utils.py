@@ -460,7 +460,6 @@ class FreeKVCacheBlockQueue:
         else:
             # Fall back to immediate release
             self.append(block)
-            self.num_free_blocks += 1
 
     def deferred_free_n(self, blocks: list[KVCacheBlock]) -> None:
         """Add multiple blocks to the release cache.
