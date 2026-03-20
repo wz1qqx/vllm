@@ -2002,10 +2002,13 @@ class NixlConnectorWorker:
                     and req_id not in self._reqs_to_process
                 ):
                     logger.error(
-                        "Potentially invalid KV blocks for "
-                        "unrecognized request %s were retrieved by "
-                        "a decode worker. They may have expired.",
+                        "Potentially invalid KV blocks for unrecognized "
+                        "request %s (len=%d) were retrieved by a decode "
+                        "worker. They may have expired. "
+                        "reqs_to_send_sample=%s",
                         req_id,
+                        len(req_id),
+                        list(self._reqs_to_send.keys())[:3],
                     )
                     continue
 
@@ -2204,11 +2207,25 @@ class NixlConnectorWorker:
             if self.use_mla and tp_ratio < 0:
                 # ..but we still need to notify the other remote ranks that we
                 # have the blocks we need so they can update the request state.
-                notif_id = f"{req_id}:{self.world_size}".encode()
+                # NOTE: must use meta.remote.request_id (prefill-side ID), not
+                # req_id (decode-side ID). In Dynamo KVBM mode these share the
+                # same base UUID but carry different hash suffixes.
+                notif_id = f"{meta.remote.request_id}:{self.world_size}".encode()
                 remote_agents = self._remote_agents[meta.remote.engine_id]
+                sent_to = []
                 for rank_to_notify, agent in remote_agents.items():
                     if rank_to_notify != remote_rank:
                         self.nixl_wrapper.send_notif(agent, notif_msg=notif_id)
+                        sent_to.append(rank_to_notify)
+                logger.debug(
+                    "MLA send_notif: tp_rank=%d, local_req=%s, "
+                    "remote_req=%s, notif=%s, sent_to_ranks=%s",
+                    self.tp_rank,
+                    req_id,
+                    meta.remote.request_id,
+                    notif_id.decode(),
+                    sent_to,
+                )
 
     def _read_blocks(
         self,
@@ -2356,6 +2373,15 @@ class NixlConnectorWorker:
 
             # Begin async xfer.
             self.nixl_wrapper.transfer(handle)
+            logger.debug(
+                "RDMA READ posted: tp_rank=%d, local_req=%s, "
+                "remote_req=%s, notif_msg=%s, descs=%d",
+                self.tp_rank,
+                request_id,
+                remote_request_id,
+                notif_id.decode(),
+                len(local_block_descs_ids),
+            )
 
             # Use handle to check completion in future step().
             self._recving_transfers[request_id].append(handle)
