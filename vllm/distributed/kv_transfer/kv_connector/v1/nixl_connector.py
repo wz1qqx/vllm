@@ -617,13 +617,28 @@ class NixlConnectorScheduler:
         with zmq_ctx(zmq.ROUTER, path) as sock:
             sock.setsockopt(zmq.RCVTIMEO, 1000)
             ready_event.set()
+            logger.info(
+                "NIXL handshake listener started on %s (port %d)",
+                path, port,
+            )
             while True:
                 try:
-                    identity, _, msg = sock.recv_multipart()
+                    frames = sock.recv_multipart()
                 except zmq.Again:
                     if stop_event.is_set():
                         break
                     continue
+                if len(frames) != 3:
+                    logger.warning(
+                        "Handshake listener: got %d frames (expected 3). "
+                        "Frame sizes: %s. Possible stray connection "
+                        "or non-REQ socket on port %d.",
+                        len(frames),
+                        [len(f) for f in frames],
+                        port,
+                    )
+                    continue
+                identity, _, msg = frames
                 # Decode the message which contains (GET_META_MSG, rank)
                 msg, target_tp_rank = msgspec.msgpack.decode(msg)
                 logger.debug(
@@ -772,6 +787,21 @@ class NixlConnectorScheduler:
         meta.reqs_in_batch = self._reqs_in_batch
         meta.reqs_not_processed = self._reqs_not_processed
 
+        # [DIAG] Log queue depths for prefill accumulation diagnosis
+        n_recv = len(meta.reqs_to_recv)
+        n_send = len(meta.reqs_to_send)
+        n_save = len(self._reqs_need_save)
+        n_batch = len(meta.reqs_in_batch)
+        if n_recv > 0 or n_send > 0 or n_save > 0:
+            logger.info(
+                "[DIAG] build_connector_meta: "
+                "reqs_to_recv=%d, reqs_to_send=%d, "
+                "reqs_need_save=%d, reqs_in_batch=%d, "
+                "reqs_not_processed=%d",
+                n_recv, n_send, n_save, n_batch,
+                len(meta.reqs_not_processed),
+            )
+
         # Clear the list once workers start the transfers
         self._reqs_need_recv.clear()
         self._reqs_in_batch = set()
@@ -829,11 +859,14 @@ class NixlConnectorScheduler:
 
         if delay_free_blocks:
             # Prefill request on remote. It will be read from D upon completion
-            logger.debug(
-                "NIXLConnector request_finished(%s) waiting for %d seconds "
-                "for remote decode to fetch blocks",
+            logger.info(
+                "[DIAG] request_finished(P): req=%s, "
+                "delay_free blocks=%d, timeout=%ds, "
+                "pending_send_total=%d",
                 request.request_id,
+                len(block_ids),
                 envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT,
+                len(self._reqs_need_send) + 1,
             )
             self._reqs_need_send[request.request_id] = (
                 time.perf_counter() + envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT
@@ -1051,6 +1084,12 @@ class NixlConnectorWorker:
         path = make_zmq_path("tcp", host, port)
 
         with zmq_ctx(zmq.REQ, path) as sock:
+            logger.info(
+                "[DIAG] _nixl_handshake: connecting to %s, "
+                "remote_ranks=%s, expected_engine=%s",
+                path, p_remote_ranks, expected_engine_id,
+            )
+            handshake_start = time.perf_counter()
             for remote_rank in p_remote_ranks:
                 logger.debug(
                     "Querying metadata on path: %s at remote tp rank %s",
@@ -1136,6 +1175,13 @@ class NixlConnectorWorker:
                     setup_agent_time - got_metadata_time,
                 )
                 remote_rank_to_agent_name[remote_rank] = remote_agent_name
+            logger.info(
+                "[DIAG] _nixl_handshake: completed with %s in %.3fs, "
+                "%d remote ranks registered",
+                expected_engine_id,
+                time.perf_counter() - handshake_start,
+                len(remote_rank_to_agent_name),
+            )
         return remote_rank_to_agent_name
 
     def initialize_host_xfer_buffer(self, kv_caches: dict[str, torch.Tensor]) -> None:
@@ -1930,13 +1976,24 @@ class NixlConnectorWorker:
         done_recving.update(self._failed_recv_reqs)
         self._failed_recv_reqs.clear()
 
-        if len(done_sending) > 0 or len(done_recving) > 0:
-            logger.debug(
-                "Rank %s, get_finished: %s requests done sending "
-                "and %s requests done recving",
+        # [DIAG] Always log transfer pipeline state
+        n_pending_recv = len(self._recving_transfers)
+        n_pending_send = len(self._reqs_to_send)
+        n_pending_process = len(self._reqs_to_process)
+        if (len(done_sending) > 0 or len(done_recving) > 0
+                or n_pending_recv > 0 or n_pending_send > 0):
+            logger.info(
+                "[DIAG] get_finished: rank=%d, done_send=%d, "
+                "done_recv=%d, pending_recv_xfers=%d, "
+                "pending_send=%d, pending_process=%d, "
+                "failed_recv=%d",
                 self.tp_rank,
                 len(done_sending),
                 len(done_recving),
+                n_pending_recv,
+                n_pending_send,
+                n_pending_process,
+                len(self._failed_recv_reqs),
             )
 
         block_ids_for_blocksize_post_process = defaultdict(list)
@@ -2101,6 +2158,18 @@ class NixlConnectorWorker:
         Start loading by triggering non-blocking nixl_xfer.
         We check for these trnxs to complete in each step().
         """
+        # [DIAG] Summary log for load_kv batch
+        if metadata.reqs_to_recv:
+            logger.info(
+                "[DIAG] start_load_kv: %d reqs_to_recv, %d reqs_to_send, "
+                "%d reqs_in_batch, pending_recving=%d, pending_handshakes=%d",
+                len(metadata.reqs_to_recv),
+                len(metadata.reqs_to_send),
+                len(metadata.reqs_in_batch),
+                len(self._recving_transfers),
+                len(self._handshake_futures),
+            )
+
         for req_id, meta in metadata.reqs_to_recv.items():
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
                 meta.local_block_ids
@@ -2110,13 +2179,15 @@ class NixlConnectorWorker:
                 meta.remote.block_ids
             )
             remote_engine_id = meta.remote.engine_id
-            logger.debug(
-                "start_load_kv for request %s from remote engine %s. "
-                "Num local_block_ids: %s. Num remote_block_ids: %s. ",
+            logger.info(
+                "[DIAG] start_load_kv: req=%s, remote_engine=%s, "
+                "local_blocks=%d, remote_blocks=%d, "
+                "handshake_needed=%s",
                 req_id,
                 remote_engine_id,
                 len(meta.local_physical_block_ids),
                 len(meta.remote.block_ids),
+                remote_engine_id not in self._remote_agents,
             )
             # always store metadata for failure recovery
             self._recving_metadata[req_id] = meta
@@ -2373,14 +2444,18 @@ class NixlConnectorWorker:
 
             # Begin async xfer.
             self.nixl_wrapper.transfer(handle)
-            logger.debug(
-                "RDMA READ posted: tp_rank=%d, local_req=%s, "
-                "remote_req=%s, notif_msg=%s, descs=%d",
+            logger.info(
+                "[DIAG] RDMA READ posted: tp_rank=%d, req=%s, "
+                "remote_req=%s, remote_engine=%s, remote_rank=%d, "
+                "descs=%d, local_blocks=%d, notif=%s",
                 self.tp_rank,
                 request_id,
                 remote_request_id,
-                notif_id.decode(),
+                dst_engine_id,
+                remote_rank,
                 len(local_block_descs_ids),
+                num_local_blocks,
+                notif_id.decode(),
             )
 
             # Use handle to check completion in future step().
