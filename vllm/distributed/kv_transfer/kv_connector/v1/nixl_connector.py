@@ -705,13 +705,28 @@ class NixlConnectorScheduler:
         with zmq_ctx(zmq.ROUTER, path) as sock:
             sock.setsockopt(zmq.RCVTIMEO, 1000)
             ready_event.set()
+            logger.info(
+                "NIXL handshake listener started on %s (port %d)",
+                path, port,
+            )
             while True:
                 try:
-                    identity, _, msg = sock.recv_multipart()
+                    frames = sock.recv_multipart()
                 except zmq.Again:
                     if stop_event.is_set():
                         break
                     continue
+                if len(frames) != 3:
+                    logger.warning(
+                        "Handshake listener: got %d frames (expected 3). "
+                        "Frame sizes: %s. Possible stray connection "
+                        "or non-REQ socket on port %d.",
+                        len(frames),
+                        [len(f) for f in frames],
+                        port,
+                    )
+                    continue
+                identity, _, msg = frames
                 # Decode the message which contains (GET_META_MSG, rank)
                 msg, target_tp_rank = msgspec.msgpack.decode(msg)
                 logger.debug(
@@ -971,11 +986,12 @@ class NixlConnectorScheduler:
 
         if delay_free_blocks:
             # Prefill request on remote. It will be read from D upon completion
-            logger.debug(
-                "NIXLConnector request_finished(%s) waiting for %d seconds "
-                "for remote decode to fetch blocks",
+            logger.info(
+                "[KV] request_finished(P): req=%s, blocks=%d, "
+                "pending_send=%d",
                 request.request_id,
-                envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT,
+                len(block_ids),
+                len(self._reqs_need_send) + 1,
             )
             self._reqs_need_send[request.request_id] = (
                 time.perf_counter() + envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT
@@ -1286,6 +1302,7 @@ class NixlConnectorWorker:
         path = make_zmq_path("tcp", host, port)
 
         with zmq_ctx(zmq.REQ, path) as sock:
+            handshake_start = time.perf_counter()
             for remote_rank in p_remote_ranks:
                 logger.debug(
                     "Querying metadata on path: %s at remote tp rank %s",
@@ -1371,6 +1388,12 @@ class NixlConnectorWorker:
                     setup_agent_time - got_metadata_time,
                 )
                 remote_rank_to_agent_name[remote_rank] = remote_agent_name
+            logger.info(
+                "[KV] handshake completed: engine=%s, %.3fs, %d ranks",
+                expected_engine_id,
+                time.perf_counter() - handshake_start,
+                len(remote_rank_to_agent_name),
+            )
         return remote_rank_to_agent_name
 
     def initialize_host_xfer_buffer(self, kv_caches: dict[str, torch.Tensor]) -> None:
@@ -1545,6 +1568,36 @@ class NixlConnectorWorker:
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in nixl."""
+        # Filter out speculative decoding draft model layers (e.g. Eagle3).
+        # Draft layers share a kv_cache_group with target model layers but
+        # have different num_blocks. NIXL only transfers target model KV
+        # cache, so we determine target layer count and exclude draft layers
+        # whose index >= num_target_layers.
+        spec_cfg = self.vllm_config.speculative_config
+        if spec_cfg is not None and spec_cfg.draft_model_config is not None:
+            num_target_layers = (
+                self.vllm_config.model_config.get_num_layers(
+                    self.vllm_config.parallel_config
+                )
+            )
+            filtered = {}
+            for name, cache in kv_caches.items():
+                # Layer names follow "model.layers.{idx}.self_attn" pattern.
+                # Draft layers start at index == num_target_layers.
+                parts = name.split(".")
+                try:
+                    layer_idx = int(parts[parts.index("layers") + 1])
+                except (ValueError, IndexError):
+                    layer_idx = -1
+                if layer_idx >= 0 and layer_idx >= num_target_layers:
+                    logger.info(
+                        "Skipping draft model layer %s (idx=%d >= %d) "
+                        "from NIXL registration",
+                        name, layer_idx, num_target_layers,
+                    )
+                    continue
+                filtered[name] = cache
+            kv_caches = filtered
         self.kv_topo = TpKVTopology(
             tp_rank=self.tp_rank,
             engine_id=self.engine_id,
@@ -2280,14 +2333,12 @@ class NixlConnectorWorker:
         done_recving.update(self._failed_recv_reqs)
         self._failed_recv_reqs.clear()
 
-        if len(done_sending) > 0 or len(done_recving) > 0:
-            logger.debug(
-                "Rank %s, get_finished: %s requests done sending "
-                "and %s requests done recving",
-                self.tp_rank,
-                len(done_sending),
-                len(done_recving),
-            )
+        if done_sending:
+            for req_id in done_sending:
+                logger.info("[KV] send_done(P): req=%s", req_id)
+        if done_recving:
+            for req_id in done_recving:
+                logger.info("[KV] recv_done(D): req=%s", req_id)
 
         block_ids_for_blocksize_post_process = defaultdict(list)
         for req_id in done_recving:
@@ -2353,10 +2404,13 @@ class NixlConnectorWorker:
                     and req_id not in self._reqs_to_process
                 ):
                     logger.error(
-                        "Potentially invalid KV blocks for "
-                        "unrecognized request %s were retrieved by "
-                        "a decode worker. They may have expired.",
+                        "Potentially invalid KV blocks for unrecognized "
+                        "request %s (len=%d) were retrieved by a decode "
+                        "worker. They may have expired. "
+                        "reqs_to_send_sample=%s",
                         req_id,
+                        len(req_id),
+                        list(self._reqs_to_send.keys())[:3],
                     )
                     continue
 
@@ -2556,7 +2610,10 @@ class NixlConnectorWorker:
             if self.use_mla and tp_ratio < 0:
                 # ..but we still need to notify the other remote ranks that we
                 # have the blocks we need so they can update the request state.
-                notif_id = f"{req_id}:{self.world_size}".encode()
+                # NOTE: must use meta.remote.request_id (prefill-side ID), not
+                # req_id (decode-side ID). In Dynamo KVBM mode these share the
+                # same base UUID but carry different hash suffixes.
+                notif_id = f"{meta.remote.request_id}:{self.world_size}".encode()
                 remote_agents = self._remote_agents[meta.remote.engine_id]
                 for rank_to_notify, agent in remote_agents.items():
                     if rank_to_notify != remote_rank:
@@ -2683,6 +2740,14 @@ class NixlConnectorWorker:
 
             # Begin async xfer.
             self.nixl_wrapper.transfer(handle)
+            logger.info(
+                "[KV] RDMA READ posted: req=%s, blocks=%d, "
+                "remote_engine=%s, rank=%d",
+                request_id,
+                num_local_blocks,
+                dst_engine_id,
+                remote_rank,
+            )
 
             # Use handle to check completion in future step().
             self._recving_transfers[request_id].append(handle)
