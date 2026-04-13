@@ -482,6 +482,36 @@ class TpKVTopology:
         tp_ratio = -tp_ratio
         return [self.tp_rank * tp_ratio + i for i in range(tp_ratio)]
 
+    def get_all_pp_tp_targets(
+        self,
+        remote_tp_size: int,
+        remote_pp_size: int,
+    ) -> list[int]:
+        """
+        Get global worker indices across ALL PP stages for this local TP rank.
+
+        With PP>1 on the remote (Prefill), workers are indexed globally as:
+            global_idx = pp_rank * remote_tp_size + tp_rank
+
+        For each TP rank in get_target_remote_ranks(remote_tp_size), this
+        method returns the corresponding global index for EVERY PP stage, so
+        that the Decode worker can establish NIXL connections to all PP stages
+        and read layer ranges from each.
+
+        When remote_pp_size=1, result equals get_target_remote_ranks (compat).
+
+        Example (D_TP=8, remote PP2+TP4):
+          D_rank=0 -> get_target_remote_ranks(4)=[0] -> [0, 4]  (PP0+PP1)
+          D_rank=2 -> get_target_remote_ranks(4)=[1] -> [1, 5]
+          D_rank=6 -> get_target_remote_ranks(4)=[3] -> [3, 7]
+        """
+        tp_targets = self.get_target_remote_ranks(remote_tp_size)
+        return [
+            tp_rank + pp_rank * remote_tp_size
+            for pp_rank in range(remote_pp_size)
+            for tp_rank in tp_targets
+        ]
+
     def get_target_remote_ranks_from_engine_id(
         self,
         remote_engine_id: EngineId,
