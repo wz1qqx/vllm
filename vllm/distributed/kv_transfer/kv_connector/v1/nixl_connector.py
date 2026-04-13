@@ -264,6 +264,7 @@ class ReqMeta:
     # To be used when logical block size does not match the kernel block size
     local_physical_block_ids: BlockIds
     tp_size: int
+    pp_size: int = 1
     remote: RemoteMeta | None = None
 
 
@@ -285,6 +286,7 @@ class NixlConnectorMetadata(KVConnectorMetadata):
             local_physical_block_ids=local_block_ids,
             # P workers don't need to receive tp_size from proxy here.
             tp_size=kv_transfer_params.get("tp_size", 1),
+            pp_size=kv_transfer_params.get("pp_size", 1),
         )
 
     def add_new_req_to_save(
@@ -1011,6 +1013,9 @@ class NixlConnectorScheduler:
             remote_host=self.side_channel_host,
             remote_port=self.side_channel_port,
             tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
+            pp_size=getattr(
+                self.vllm_config.parallel_config, "pipeline_parallel_size", 1
+            ) or 1,
         )
 
 
@@ -1276,8 +1281,14 @@ class NixlConnectorWorker:
         port: int,
         remote_tp_size: int,
         expected_engine_id: str,
+        remote_pp_size: int = 1,
     ) -> dict[int, str]:
-        """Do a NIXL handshake with a remote instance."""
+        """Do a NIXL handshake with a remote instance.
+
+        When remote_pp_size > 1 (Pipeline Parallelism on Prefill), connects
+        to workers in ALL PP stages so that Decode can transfer KV for every
+        layer range.  Global worker index = pp_rank * remote_tp_size + tp_rank.
+        """
 
         # the first time we connect to a remote agent.
         # be careful, the handshake happens in a background thread.
@@ -1294,10 +1305,17 @@ class NixlConnectorWorker:
         # When target instance TP > local TP, we need to perform multiple
         # handshakes. Do it in a single background job for simplicity.
         # Regardless, only handshake with the remote TP rank(s) that current
-        # local rank will read from. Note that With homogeneous TP,
+        # local rank will read from. Note that with homogeneous TP,
         # this happens to be the same single rank_i.
+        # With PP > 1, also connect to corresponding ranks in each PP stage so
+        # that all layer ranges are reachable for KV transfer.
         assert self.kv_topo is not None
-        p_remote_ranks = self.kv_topo.get_target_remote_ranks(remote_tp_size)
+        if remote_pp_size > 1:
+            p_remote_ranks = self.kv_topo.get_all_pp_tp_targets(
+                remote_tp_size, remote_pp_size
+            )
+        else:
+            p_remote_ranks = self.kv_topo.get_target_remote_ranks(remote_tp_size)
         remote_rank_to_agent_name = {}
         path = make_zmq_path("tcp", host, port)
 
@@ -1515,6 +1533,7 @@ class NixlConnectorWorker:
                 meta.remote.port,
                 meta.tp_size,
                 remote_engine_id,
+                meta.pp_size,
             )
             self._handshake_futures[remote_engine_id] = fut
 

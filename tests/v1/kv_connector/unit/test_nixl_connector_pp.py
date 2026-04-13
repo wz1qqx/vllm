@@ -328,3 +328,170 @@ class TestTpKVTopologyPP:
         topo = self._make_topology(d_tp_rank=0, d_tp_size=8)
         result = topo.get_all_pp_tp_targets(remote_tp_size=2, remote_pp_size=4)
         assert result == [0, 2, 4, 6], f"Got {result}"
+
+
+# ===========================================================================
+# Tests: NixlConnector PP wiring (Wave 2.3)
+# ===========================================================================
+
+class TestNixlConnectorPPWiring:
+    """
+    Three wiring changes needed for PP KV transfer:
+
+    1. ReqMeta gets a pp_size field so each request carries the remote PP size.
+    2. NixlConnectorMetadata._add_new_req reads pp_size from kv_transfer_params.
+    3. NixlConnectorScheduler.request_finished includes pp_size in the returned dict.
+    4. NixlConnectorWorker._nixl_handshake receives remote_pp_size and uses
+       get_all_pp_tp_targets instead of get_target_remote_ranks.
+    """
+
+    # --- [FAILS_NOW] ReqMeta.pp_size field ---
+
+    def test_req_meta_has_pp_size_field(self):
+        """[FAILS_NOW] ReqMeta must have a pp_size field (default 1)."""
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector import ReqMeta
+        import dataclasses
+
+        fields = {f.name for f in dataclasses.fields(ReqMeta)}
+        assert "pp_size" in fields, (
+            f"ReqMeta missing pp_size field. Current fields: {fields}. "
+            "Add: pp_size: int = 1"
+        )
+
+    def test_req_meta_pp_size_default_is_1(self):
+        """[FAILS_NOW] ReqMeta.pp_size must default to 1 (backward compat)."""
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector import ReqMeta
+
+        req = ReqMeta(
+            local_block_ids=[],
+            local_physical_block_ids=[],
+            tp_size=4,
+            # pp_size not specified — should default to 1
+        )
+        assert req.pp_size == 1, f"Expected pp_size=1 (default), got {req.pp_size}"
+
+    # --- [FAILS_NOW] kv_transfer_params includes pp_size ---
+
+    def test_add_new_req_reads_pp_size_from_params(self):
+        """[FAILS_NOW] _add_new_req must read pp_size from kv_transfer_params."""
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector import (
+            NixlConnectorMetadata,
+        )
+
+        meta = NixlConnectorMetadata()
+        req_meta = meta._add_new_req(
+            local_block_ids=[0, 1, 2],
+            kv_transfer_params={"tp_size": 4, "pp_size": 2},
+        )
+        assert req_meta.pp_size == 2, (
+            f"Expected pp_size=2 from kv_transfer_params, got {req_meta.pp_size}. "
+            "Fix: tp_size=kv_transfer_params.get('pp_size', 1)"
+        )
+
+    def test_add_new_req_pp_size_defaults_to_1(self):
+        """[FAILS_NOW] _add_new_req pp_size=1 when not in kv_transfer_params."""
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector import (
+            NixlConnectorMetadata,
+        )
+
+        meta = NixlConnectorMetadata()
+        req_meta = meta._add_new_req(
+            local_block_ids=[0],
+            kv_transfer_params={"tp_size": 8},  # no pp_size key
+        )
+        assert req_meta.pp_size == 1
+
+    # --- [FAILS_NOW] NixlConnectorScheduler.request_finished includes pp_size ---
+
+    def test_request_finished_kv_transfer_params_includes_pp_size(self):
+        """[FAILS_NOW] kv_transfer_params returned by request_finished must include pp_size."""
+        from unittest.mock import MagicMock, patch
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector import (
+            NixlConnectorScheduler,
+        )
+        from vllm.v1.kv_cache_interface import (
+            FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec,
+        )
+
+        cfg = MagicMock()
+        cfg.cache_config.block_size = 16
+        cfg.parallel_config.data_parallel_index = 0
+        cfg.parallel_config.tensor_parallel_size = 4
+        cfg.parallel_config.pipeline_parallel_size = 2  # PP2
+        cfg.scheduler_config.disable_hybrid_kv_cache_manager = True
+        cfg.kv_transfer_config = MagicMock()
+        cfg.kv_transfer_config.kv_buffer_device = "cpu"
+
+        kv_cache_config = KVCacheConfig(
+            num_blocks=4,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["layer0"],
+                    FullAttentionSpec(block_size=16, num_kv_heads=4,
+                                     head_size=16, dtype=torch.float16),
+                )
+            ],
+        )
+
+        with patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector.current_platform"
+        ) as mock_platform:
+            mock_platform.device_type = "cpu"
+            sched = NixlConnectorScheduler(cfg, "engine-0", kv_cache_config)
+
+        from vllm.v1.request import RequestStatus
+
+        # Mock a finished Decode-side request (do_remote_decode=True)
+        mock_request = MagicMock()
+        mock_request.request_id = "req-1"
+        mock_request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        mock_request.kv_transfer_params = {"do_remote_decode": True}
+
+        with patch.object(sched, "get_sw_clipped_blocks", return_value=[[0, 1, 2]]):
+            _, kv_params = sched.request_finished(mock_request, [[0, 1, 2]])
+
+        assert kv_params is not None, "request_finished should return kv_transfer_params"
+        assert "pp_size" in kv_params, (
+            f"kv_transfer_params missing pp_size. Got keys: {list(kv_params.keys())}. "
+            "Fix: add pp_size=vllm_config.parallel_config.pipeline_parallel_size"
+        )
+        assert kv_params["pp_size"] == 2, (
+            f"Expected pp_size=2 (from PP2 config), got {kv_params.get('pp_size')}"
+        )
+
+    # --- [FAILS_NOW] _nixl_handshake uses get_all_pp_tp_targets ---
+
+    def test_nixl_handshake_uses_get_all_pp_tp_targets_for_pp2(self):
+        """[FAILS_NOW] With remote_pp_size=2, _nixl_handshake must request
+        global indices from get_all_pp_tp_targets (not get_target_remote_ranks).
+
+        Verifies that the method calls get_all_pp_tp_targets when remote_pp_size > 1.
+        """
+        from vllm.distributed.kv_transfer.kv_connector.utils import TpKVTopology
+
+        mock_backend = MagicMock()
+        mock_backend.get_kv_cache_shape.return_value = (1, 16, 4, 1, 1)
+        mock_backend.get_kv_cache_stride_order.side_effect = NotImplementedError
+
+        topo = TpKVTopology(
+            tp_rank=0,
+            engine_id="prefill",
+            remote_tp_size={"prefill": 8},
+            remote_block_size={"prefill": 16},
+            is_mla=True,
+            total_num_kv_heads=4,
+            attn_backends=[mock_backend],
+            tensor_shape=None,
+        )
+
+        # With remote PP2+TP4, D_rank=0 must query global indices [0, 4]
+        targets_pp2 = topo.get_all_pp_tp_targets(remote_tp_size=4, remote_pp_size=2)
+        targets_pp1 = topo.get_target_remote_ranks(remote_tp_size=4)
+
+        # PP2 must return more targets than PP1
+        assert len(targets_pp2) > len(targets_pp1), (
+            f"PP2 ({targets_pp2}) should have more targets than PP1 ({targets_pp1})"
+        )
+        assert targets_pp2 == [0, 4], f"Expected [0, 4] for D_rank=0 PP2+TP4, got {targets_pp2}"
+        assert targets_pp1 == [0], f"Expected [0] for D_rank=0 TP4 (PP1), got {targets_pp1}"
