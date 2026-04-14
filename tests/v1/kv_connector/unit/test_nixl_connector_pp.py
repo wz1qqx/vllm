@@ -722,3 +722,140 @@ class TestGetBlockDescsIdsNumRegionsOverride:
         # With override=27 (full model, PP=1 scenario), same result
         ids_override_27 = self._compute_descs_ids(27, num_blocks, block_ids)
         assert ids_no_override == ids_override_27
+
+    def test_local_remote_same_override_equal_lengths(self):
+        """Invariant: local and remote desc ID arrays must have equal length.
+
+        Mirrors the assert in _read_blocks:
+            assert len(local_block_descs_ids) == len(remote_block_descs_ids)
+
+        With pp_num_regions override on both sides, lengths are equal regardless
+        of the request's block count.
+        """
+        local_num_blocks = 200
+        remote_num_blocks = 150
+        pp_num_regions = 7
+        request_block_ids = [0, 3, 8, 14, 50]
+
+        local_ids = self._compute_descs_ids(pp_num_regions, local_num_blocks, request_block_ids)
+        remote_ids = self._compute_descs_ids(pp_num_regions, remote_num_blocks, request_block_ids)
+        assert len(local_ids) == len(remote_ids), (
+            f"local={len(local_ids)} remote={len(remote_ids)} must be equal"
+        )
+        assert len(local_ids) == pp_num_regions * len(request_block_ids)
+
+    def test_without_override_lengths_differ(self):
+        """Documents the original bug: using full num_regions on local (override=7)
+        vs remote (no override=27) causes length mismatch → AssertionError."""
+        local_num_blocks = 200
+        remote_num_blocks = 150
+        full_num_regions = 27
+        pp_num_regions = 7
+        request_block_ids = [0, 3, 8]
+
+        # local with override, remote without (old broken behavior)
+        local_ids_override = self._compute_descs_ids(pp_num_regions, local_num_blocks, request_block_ids)
+        remote_ids_full = self._compute_descs_ids(full_num_regions, remote_num_blocks, request_block_ids)
+        assert len(local_ids_override) != len(remote_ids_full), (
+            "Expected mismatch documenting the pre-fix bug"
+        )
+
+
+class TestBuildLayerRangeXferHandleStride:
+    """
+    _build_layer_range_xfer_handle must derive entries_per_layer from
+    len(src_blocks_data) // num_local_layers rather than using num_blocks
+    directly. This fixes the stride for blocks-first (FlashInfer) layout where
+    each layer contributes 2 * num_blocks entries (K + V as separate regions).
+    """
+
+    @staticmethod
+    def _make_blocks_data(num_layers: int, num_blocks: int, blocks_first: bool):
+        """Build a mock src_blocks_data matching register_local_xfer_handler output."""
+        data = []
+        for layer in range(num_layers):
+            # K entries
+            for b in range(num_blocks):
+                data.append((layer * 1000 + b, 64, 0))
+            if blocks_first:
+                # V entries appended right after K for this layer
+                for b in range(num_blocks):
+                    data.append((layer * 1000 + num_blocks + b, 32, 0))
+        return data
+
+    def _entries_per_layer(self, src_blocks_data, num_local_layers):
+        """Replicate the fix's computation."""
+        return len(src_blocks_data) // num_local_layers
+
+    def test_standard_layout_stride_equals_num_blocks(self):
+        """Non-blocks-first: entries_per_layer == num_blocks."""
+        num_layers, num_blocks = 27, 100
+        data = self._make_blocks_data(num_layers, num_blocks, blocks_first=False)
+        assert len(data) == num_layers * num_blocks
+        assert self._entries_per_layer(data, num_layers) == num_blocks
+
+    def test_blocks_first_stride_equals_2x_num_blocks(self):
+        """FlashInfer (blocks-first): entries_per_layer == 2 * num_blocks."""
+        num_layers, num_blocks = 27, 100
+        data = self._make_blocks_data(num_layers, num_blocks, blocks_first=True)
+        assert len(data) == num_layers * num_blocks * 2
+        assert self._entries_per_layer(data, num_layers) == num_blocks * 2
+
+    def test_slice_standard_pp4_stage0(self):
+        """Standard: slice [0:7] has exactly 7 * num_blocks entries."""
+        num_layers, num_blocks = 27, 100
+        data = self._make_blocks_data(num_layers, num_blocks, blocks_first=False)
+        epl = self._entries_per_layer(data, num_layers)
+        sliced = data[0 * epl : 7 * epl]
+        assert len(sliced) == 7 * num_blocks
+
+    def test_slice_blocks_first_pp4_stage0(self):
+        """FlashInfer: slice [0:7] has exactly 7 * 2 * num_blocks entries."""
+        num_layers, num_blocks = 27, 100
+        data = self._make_blocks_data(num_layers, num_blocks, blocks_first=True)
+        epl = self._entries_per_layer(data, num_layers)
+        sliced = data[0 * epl : 7 * epl]
+        assert len(sliced) == 7 * num_blocks * 2
+
+    def test_old_stride_wrong_for_blocks_first(self):
+        """Documents the old bug: using num_blocks as stride cuts off V entries."""
+        num_layers, num_blocks = 27, 100
+        data = self._make_blocks_data(num_layers, num_blocks, blocks_first=True)
+        # Old code used num_blocks as stride
+        old_sliced = data[0 * num_blocks : 7 * num_blocks]
+        # New code uses entries_per_layer = 2 * num_blocks
+        epl = self._entries_per_layer(data, num_layers)
+        new_sliced = data[0 * epl : 7 * epl]
+        assert len(old_sliced) == 7 * num_blocks        # too short (missing V)
+        assert len(new_sliced) == 7 * num_blocks * 2    # correct
+        assert len(old_sliced) != len(new_sliced)
+
+    def test_num_pp_regions_blocks_first_is_2x_layers(self):
+        """PP num_pp_regions for blocks-first = num_pp_layers * regions_per_layer (=2)."""
+        num_layers, num_blocks = 27, 100
+        data = self._make_blocks_data(num_layers, num_blocks, blocks_first=True)
+        # Simulate: num_regions = 54 (27 * 2), num_local_layers = 27
+        num_regions = num_layers * 2  # is_kv_layout_blocks_first doubles regions
+        regions_per_layer = num_regions // num_layers
+        assert regions_per_layer == 2
+
+        num_pp_layers = 7
+        num_pp_regions = num_pp_layers * regions_per_layer
+        assert num_pp_regions == 14  # override value for PP stage of 7 layers
+
+    def test_all_pp4_slices_cover_all_layers_blocks_first(self):
+        """FlashInfer PP4: 4 slices together cover all 27*2*num_blocks entries."""
+        num_layers, num_blocks = 27, 100
+        data = self._make_blocks_data(num_layers, num_blocks, blocks_first=True)
+        epl = self._entries_per_layer(data, num_layers)
+
+        pp_layer_counts = [7, 7, 7, 6]
+        offset = 0
+        all_sliced = []
+        for count in pp_layer_counts:
+            sliced = data[offset * epl : (offset + count) * epl]
+            all_sliced.extend(sliced)
+            offset += count
+
+        assert len(all_sliced) == num_layers * num_blocks * 2
+        assert all_sliced == data

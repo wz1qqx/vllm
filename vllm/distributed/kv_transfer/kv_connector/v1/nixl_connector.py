@@ -1420,17 +1420,27 @@ class NixlConnectorWorker:
                 # Ensures make_prepped_xfer src/dst descriptor counts match.
                 if remote_pp_size > 1 and hasattr(self, "src_blocks_data"):
                     num_pp_layers = len(metadata.kv_caches_base_addr)
+                    # regions_per_layer = 1 for standard layout, 2 for blocks-first
+                    # (FlashInfer stores K and V as separate regions per layer).
+                    num_local_layers = len(
+                        self.kv_caches_base_addr[self.engine_id][self.tp_rank]
+                    )
+                    regions_per_layer = self.num_regions // num_local_layers
+                    num_pp_regions = num_pp_layers * regions_per_layer
                     self._pp_src_xfer_handles[(expected_engine_id, remote_rank)] = (
                         self._build_layer_range_xfer_handle(
                             pp_layer_offset, pp_layer_offset + num_pp_layers
                         ),
-                        num_pp_layers,
+                        num_pp_regions,
                     )
                     logger.debug(
-                        "PP layer-range handle: rank=%d layers=[%d:%d] key=%s",
+                        "PP layer-range handle: rank=%d layers=[%d:%d] "
+                        "regions_per_layer=%d num_pp_regions=%d key=%s",
                         remote_rank,
                         pp_layer_offset,
                         pp_layer_offset + num_pp_layers,
+                        regions_per_layer,
+                        num_pp_regions,
                         expected_engine_id,
                     )
                     pp_layer_offset += num_pp_layers
@@ -1943,13 +1953,17 @@ class NixlConnectorWorker:
         own layer subset. The Decode side needs a matching local src handle that
         covers exactly those layers so that make_prepped_xfer descriptor counts match.
 
-        src_blocks_data layout (per-layer, per-block): layer0_block0, layer0_block1,
-        ..., layer0_blockN, layer1_block0, ..., layer(L-1)_blockN.
+        src_blocks_data layout: entries_per_layer entries per layer, where
+        entries_per_layer = num_blocks for standard layout and num_blocks * 2 for
+        blocks-first (FlashInfer) layout which stores K and V regions separately.
+        Derived as len(src_blocks_data) // num_local_layers to be layout-agnostic.
         """
-        num_blocks = self.num_blocks
-        # src_blocks_data has one entry per (layer, block) pair
+        num_local_layers = len(
+            self.kv_caches_base_addr[self.engine_id][self.tp_rank]
+        )
+        entries_per_layer = len(self.src_blocks_data) // num_local_layers
         sliced_data = self.src_blocks_data[
-            start_layer * num_blocks : end_layer * num_blocks
+            start_layer * entries_per_layer : end_layer * entries_per_layer
         ]
         descs = self.nixl_wrapper.get_xfer_descs(sliced_data, self.nixl_memory_type)
         return self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs)
@@ -2682,12 +2696,13 @@ class NixlConnectorWorker:
 
             # PP layer-range routing: override local handle with the per-PP-rank
             # slice so src/dst descriptor counts match in make_prepped_xfer.
-            # Also record num_pp_layers so _get_block_descs_ids uses the right
-            # num_regions for the slice handle instead of the full model layers.
+            # Also pass pp_num_regions so _get_block_descs_ids uses the right
+            # region count for both local and remote handles instead of the
+            # full model's num_regions.
             pp_key = (meta.remote.engine_id, remote_rank)
-            pp_local_num_layers: int | None = None
+            pp_num_regions: int | None = None
             if pp_key in self._pp_src_xfer_handles:
-                local_xfer_side_handle, pp_local_num_layers = (
+                local_xfer_side_handle, pp_num_regions = (
                     self._pp_src_xfer_handles[pp_key]
                 )
 
@@ -2704,7 +2719,7 @@ class NixlConnectorWorker:
                 remote_rank=remote_rank,
                 local_xfer_side_handle=local_xfer_side_handle,
                 remote_xfer_side_handle=remote_xfer_side_handle,
-                local_num_layers=pp_local_num_layers,
+                pp_num_regions=pp_num_regions,
             )
 
             if self.use_mla and tp_ratio < 0:
@@ -2729,7 +2744,7 @@ class NixlConnectorWorker:
         remote_rank: int,
         local_xfer_side_handle: int,
         remote_xfer_side_handle: int,
-        local_num_layers: int | None = None,
+        pp_num_regions: int | None = None,
     ):
         """
         Post a READ point-to-point xfer request from a single local worker to
@@ -2815,18 +2830,20 @@ class NixlConnectorWorker:
         # workers will issue xfers to parts of the P worker remote kv caches.
 
         # Get descs ids.
+        # PP: when a layer-range slice handle is used, both the local (Decode)
+        # and remote (Prefill PP rank) handles cover only pp_num_regions regions.
+        # Pass num_regions_override to both sides so descriptor ID counts match
+        # (len(local) == len(remote)) and all indices stay within the handle range.
         remote_block_descs_ids = self._get_block_descs_ids(
             dst_engine_id,
             remote_block_ids,
+            num_regions_override=pp_num_regions,
         )
         local_block_descs_ids = self._get_block_descs_ids(
             self.engine_id,
             local_block_ids,
             block_size_ratio=block_size_ratio,
-            # PP: slice handle covers only num_pp_layers regions; use that count
-            # instead of self.num_regions (full model layers) to keep indices
-            # within the slice handle's descriptor range.
-            num_regions_override=local_num_layers,
+            num_regions_override=pp_num_regions,
         )
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
