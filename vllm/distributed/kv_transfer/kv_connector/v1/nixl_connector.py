@@ -2667,9 +2667,14 @@ class NixlConnectorWorker:
         tp_ratio = self.kv_topo.tp_ratio_from_engine_id(meta.remote.engine_id)
         # D may have to perform multiple reads from different remote ranks.
         for i, remote_rank in enumerate(remote_ranks):
-            if self.use_mla and tp_ratio < 0 and i > 0:
+            if self.use_mla and tp_ratio < 0 and i > 0 and meta.pp_size <= 1:
                 # MLA opt: when P TP > D TP, only a single read is executed for
-                # the first remote rank (cache is duplicated)..
+                # the first remote rank (cache is duplicated).
+                # Guard: meta.pp_size <= 1 prevents this break when PP > 1.
+                # With PP > 1, remote_ranks spans multiple PP stages (outer) ×
+                # TP ranks (inner); skipping at i=1 would drop PP stages 1..N.
+                # TODO: for PP > 1 with P.TP > D.TP (MLA), restructure to apply
+                # the skip per-PP-stage rather than globally across the flat loop.
                 break
 
             remote_block_size = self.kv_topo.remote_block_size[meta.remote.engine_id]

@@ -859,3 +859,112 @@ class TestBuildLayerRangeXferHandleStride:
 
         assert len(all_sliced) == num_layers * num_blocks * 2
         assert all_sliced == data
+
+
+# ===========================================================================
+# Tests: MLA tp_ratio < 0 break guard when PP > 1 (latent bug fix)
+# ===========================================================================
+
+class TestMlaTpRatioBreakPPGuard:
+    """
+    The MLA optimization `if use_mla and tp_ratio < 0 and i > 0: break`
+    was designed for PP=1 with P.TP > D.TP (KV replicated across P TP ranks,
+    so D only reads from rank 0 and notifies the rest).
+
+    Without the `meta.pp_size <= 1` guard, the break fires at i=1 even when
+    PP > 1, skipping PP stages 1..N entirely.
+
+    Scenario: PP4+TP4 Prefill + D.TP=1 (MLA, tp_ratio=-4)
+      get_all_pp_tp_targets(4, 4) = [0,1,2,3, 4,5,6,7, 8,9,10,11, 12,13,14,15]
+      Without guard: break at i=1 → only rank 0 (PP stage 0) processed.
+      With guard (pp_size=4 > 1): all 16 ranks processed.
+
+    Current setup (PP4+TP1 Prefill) is unaffected (tp_ratio=+1, guard irrelevant).
+    These tests document the invariant and guard logic.
+    """
+
+    @staticmethod
+    def _tp_ratio(local_tp: int, remote_tp: int) -> int:
+        """Replicate TpKVTopology.tp_ratio logic."""
+        if local_tp >= remote_tp:
+            return local_tp // remote_tp
+        return -(remote_tp // local_tp)
+
+    @staticmethod
+    def _get_all_pp_tp_targets(d_tp_rank: int, d_tp_size: int,
+                                remote_tp_size: int, remote_pp_size: int):
+        """Replicate get_all_pp_tp_targets logic."""
+        tp_ratio = TestMlaTpRatioBreakPPGuard._tp_ratio(d_tp_size, remote_tp_size)
+        if tp_ratio > 0:
+            tp_targets = [d_tp_rank // tp_ratio]
+        else:
+            r = -tp_ratio
+            tp_targets = [d_tp_rank * r + i for i in range(r)]
+        return [tr + pp * remote_tp_size
+                for pp in range(remote_pp_size)
+                for tr in tp_targets]
+
+    def _simulate_loop(self, remote_ranks, tp_ratio, use_mla, pp_size):
+        """Simulate _read_blocks_for_req loop, return list of processed ranks."""
+        processed = []
+        for i, rank in enumerate(remote_ranks):
+            if use_mla and tp_ratio < 0 and i > 0 and pp_size <= 1:
+                break  # current guard: only fires when pp_size == 1
+            processed.append(rank)
+        return processed
+
+    def test_pp1_tp1_tp1_ratio_positive_no_break(self):
+        """PP4+TP1 Prefill + D.TP=1: tp_ratio=+1, break never fires."""
+        tp_ratio = self._tp_ratio(local_tp=1, remote_tp=1)
+        assert tp_ratio == 1  # positive
+
+        remote_ranks = self._get_all_pp_tp_targets(0, 1, 1, 4)
+        assert remote_ranks == [0, 1, 2, 3]  # one rank per PP stage
+
+        processed = self._simulate_loop(remote_ranks, tp_ratio, use_mla=True, pp_size=4)
+        assert processed == [0, 1, 2, 3], "All 4 PP stages must be processed"
+
+    def test_pp4_tp4_prefill_d_tp1_without_guard_breaks_early(self):
+        """Bug: PP4+TP4 Prefill + D.TP=1, WITHOUT pp_size guard → break at i=1."""
+        tp_ratio = self._tp_ratio(local_tp=1, remote_tp=4)
+        assert tp_ratio == -4  # negative: P.TP > D.TP
+
+        remote_ranks = self._get_all_pp_tp_targets(0, 1, 4, 4)
+        assert len(remote_ranks) == 16  # 4 TP ranks × 4 PP stages
+
+        # Simulate OLD behavior (no pp_size guard)
+        processed_old = []
+        for i, rank in enumerate(remote_ranks):
+            if True and tp_ratio < 0 and i > 0:  # old: no pp_size check
+                break
+            processed_old.append(rank)
+        assert processed_old == [0], "Without guard: only rank 0 processed → BUG"
+
+    def test_pp4_tp4_prefill_d_tp1_with_guard_processes_all_stages(self):
+        """Fix: with pp_size guard (pp_size=4 > 1), break disabled → all 16 ranks."""
+        tp_ratio = self._tp_ratio(local_tp=1, remote_tp=4)
+        remote_ranks = self._get_all_pp_tp_targets(0, 1, 4, 4)
+
+        processed = self._simulate_loop(remote_ranks, tp_ratio, use_mla=True, pp_size=4)
+        assert len(processed) == 16, (
+            f"With pp_size=4 guard: all 16 ranks must be processed, got {len(processed)}"
+        )
+        assert processed == list(range(16))
+
+    def test_pp1_mla_tp_ratio_negative_break_still_works(self):
+        """PP=1 (no PP), MLA, P.TP=4 > D.TP=1: break still fires at i=1."""
+        tp_ratio = self._tp_ratio(local_tp=1, remote_tp=4)
+        remote_ranks = self._get_all_pp_tp_targets(0, 1, 4, 1)  # pp=1
+        assert remote_ranks == [0, 1, 2, 3]  # 4 P TP ranks, pp=1
+
+        processed = self._simulate_loop(remote_ranks, tp_ratio, use_mla=True, pp_size=1)
+        assert processed == [0], "PP=1 MLA opt: break at i=1, only rank 0 read (correct)"
+
+    def test_current_setup_unaffected(self):
+        """PP4+TP1 Prefill (our setup): tp_ratio=1 always, guard is irrelevant."""
+        # D.TP=1, D.TP=2, D.TP=4 — all give tp_ratio > 0 when P.TP=1
+        for d_tp in [1, 2, 4]:
+            ratio = self._tp_ratio(local_tp=d_tp, remote_tp=1)
+            assert ratio > 0, f"D.TP={d_tp}, P.TP=1 should always be positive"
+            # Verify: break condition `tp_ratio < 0` is always False
+            assert not (ratio < 0)
