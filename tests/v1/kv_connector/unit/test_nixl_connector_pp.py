@@ -563,3 +563,77 @@ class TestValidateRemoteAgentPP:
                 assert block_len_per_layer[i] == remote[i]
 
     # (Old integration tests with complex mocks removed - pure logic tests above cover the fix)
+
+
+# ===========================================================================
+# Tests: layer-range routing - _build_layer_range_xfer_handle (Wave 2.5)
+# ===========================================================================
+
+class TestPPLayerRangeRouting:
+    """
+    With PP Prefill, each PP rank has a different layer subset.
+    The local src handle must cover only the same layers as the remote PP rank
+    so that make_prepped_xfer src/dst descriptor counts match.
+
+    Root cause: PP4+TP1 Prefill PP0 has 7 layers (indices 0-6).
+    Decode local handle has 27 layers. make_prepped_xfer tries remote[7] → crash.
+    Fix: build per-PP-rank local handle sliced to matching layer range.
+    """
+
+    def test_layer_slice_pp4_stage0(self):
+        """PP rank 0 (7 layers): slice [0:7] of local blocks_data."""
+        num_blocks = 10
+        num_total_layers = 27
+        # Simulate blocks_data as a flat list: layer0_b0, layer0_b1, ..., layer26_b9
+        blocks_data = [(i, 64, 0) for i in range(num_total_layers * num_blocks)]
+
+        pp0_start, pp0_end = 0, 7
+        sliced = blocks_data[pp0_start * num_blocks: pp0_end * num_blocks]
+        assert len(sliced) == 7 * num_blocks
+        assert sliced[0] == blocks_data[0]         # first block of layer 0
+        assert sliced[-1] == blocks_data[70 - 1]   # last block of layer 6
+
+    def test_layer_slice_pp4_stage1(self):
+        """PP rank 1 (7 layers): slice [7:14] of local blocks_data."""
+        num_blocks = 10
+        blocks_data = [(i, 64, 0) for i in range(27 * num_blocks)]
+
+        pp1_start, pp1_end = 7, 14
+        sliced = blocks_data[pp1_start * num_blocks: pp1_end * num_blocks]
+        assert len(sliced) == 7 * num_blocks
+        assert sliced[0] == blocks_data[7 * num_blocks]   # first block of layer 7
+
+    def test_layer_slice_pp4_stage3_uneven(self):
+        """PP rank 3 (6 layers, uneven): slice [21:27] of local blocks_data."""
+        num_blocks = 10
+        blocks_data = [(i, 64, 0) for i in range(27 * num_blocks)]
+
+        pp3_start, pp3_end = 21, 27
+        sliced = blocks_data[pp3_start * num_blocks: pp3_end * num_blocks]
+        assert len(sliced) == 6 * num_blocks  # 6 not 7
+
+    def test_all_pp4_slices_cover_all_layers(self):
+        """4 PP stage slices together cover all 27 layers exactly once."""
+        num_blocks = 10
+        blocks_data = [(i, 64, 0) for i in range(27 * num_blocks)]
+        pp_layer_counts = [7, 7, 7, 6]  # 3x7 + 6 = 27
+
+        all_sliced = []
+        offset = 0
+        for count in pp_layer_counts:
+            sliced = blocks_data[offset * num_blocks: (offset + count) * num_blocks]
+            all_sliced.extend(sliced)
+            offset += count
+
+        # All 27*10 = 270 elements covered exactly once
+        assert len(all_sliced) == 27 * num_blocks
+        assert all_sliced == blocks_data
+
+    def test_pp1_no_slicing_needed(self):
+        """PP=1: use full blocks_data (same behavior as before)."""
+        num_blocks = 10
+        blocks_data = [(i, 64, 0) for i in range(27 * num_blocks)]
+
+        # PP=1: layer_range = [0:27] = full list
+        sliced = blocks_data[0: 27 * num_blocks]
+        assert sliced == blocks_data

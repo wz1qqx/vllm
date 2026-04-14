@@ -1195,6 +1195,11 @@ class NixlConnectorWorker:
         self.dst_num_blocks: dict[EngineId, int] = {}
         self._registered_descs: list[Any] = []
 
+        # PP-aware layer-range src handles: (engine_id, global_pp_rank) ->
+        # nixl_prepped_dlist_handle covering only that PP rank's layer subset.
+        # Built during _nixl_handshake when remote_pp_size > 1.
+        self._pp_src_xfer_handles: dict[tuple[EngineId, int], int] = {}
+
         # In progress transfers.
         # [req_id -> list[handle]]
         self._recving_metadata: dict[ReqId, ReqMeta] = {}
@@ -1317,6 +1322,9 @@ class NixlConnectorWorker:
         else:
             p_remote_ranks = self.kv_topo.get_target_remote_ranks(remote_tp_size)
         remote_rank_to_agent_name = {}
+        # PP layer offset: tracks cumulative layer count across PP ranks so each
+        # PP rank's local src handle covers only the correct layer slice.
+        pp_layer_offset = 0
         path = make_zmq_path("tcp", host, port)
 
         with zmq_ctx(zmq.REQ, path) as sock:
@@ -1406,6 +1414,25 @@ class NixlConnectorWorker:
                     setup_agent_time - got_metadata_time,
                 )
                 remote_rank_to_agent_name[remote_rank] = remote_agent_name
+
+                # PP layer-range routing: build a per-PP-rank local src handle
+                # that only covers the layer subset this PP rank has.
+                # Ensures make_prepped_xfer src/dst descriptor counts match.
+                if remote_pp_size > 1 and hasattr(self, "src_blocks_data"):
+                    num_pp_layers = len(metadata.kv_caches_base_addr)
+                    self._pp_src_xfer_handles[(expected_engine_id, remote_rank)] = (
+                        self._build_layer_range_xfer_handle(
+                            pp_layer_offset, pp_layer_offset + num_pp_layers
+                        )
+                    )
+                    logger.debug(
+                        "PP layer-range handle: rank=%d layers=[%d:%d] key=%s",
+                        remote_rank,
+                        pp_layer_offset,
+                        pp_layer_offset + num_pp_layers,
+                        expected_engine_id,
+                    )
+                    pp_layer_offset += num_pp_layers
             logger.info(
                 "[KV] handshake completed: engine=%s, %.3fs, %d ranks",
                 expected_engine_id,
@@ -1906,6 +1933,26 @@ class NixlConnectorWorker:
         # NIXL_INIT_AGENT to be used for preparations of local descs.
         return self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs), blocks_data
 
+    def _build_layer_range_xfer_handle(
+        self, start_layer: int, end_layer: int
+    ) -> int:
+        """Build a local src NIXL handle covering only layers [start_layer:end_layer].
+
+        Used for Pipeline Parallelism: each PP rank on Prefill registers only its
+        own layer subset. The Decode side needs a matching local src handle that
+        covers exactly those layers so that make_prepped_xfer descriptor counts match.
+
+        src_blocks_data layout (per-layer, per-block): layer0_block0, layer0_block1,
+        ..., layer0_blockN, layer1_block0, ..., layer(L-1)_blockN.
+        """
+        num_blocks = self.num_blocks
+        # src_blocks_data has one entry per (layer, block) pair
+        sliced_data = self.src_blocks_data[
+            start_layer * num_blocks : end_layer * num_blocks
+        ]
+        descs = self.nixl_wrapper.get_xfer_descs(sliced_data, self.nixl_memory_type)
+        return self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs)
+
     def add_remote_agent(
         self,
         nixl_agent_meta: NixlAgentMetadata,
@@ -2235,7 +2282,13 @@ class NixlConnectorWorker:
         # TP workers that handhshake with same remote have same #blocks.
         assert self.dst_num_blocks[remote_engine_id] == nixl_agent_meta.num_blocks
         # Same number of regions/~layers.
-        assert len(nixl_agent_meta.kv_caches_base_addr) == len(self.block_len_per_layer)
+        # With Pipeline Parallelism on Prefill, each PP rank registers only its
+        # layer subset, so kv_caches_base_addr has fewer entries than
+        # block_len_per_layer. Allow remote to have <= local layers (PP-aware).
+        assert len(nixl_agent_meta.kv_caches_base_addr) <= len(self.block_len_per_layer), (
+            f"Remote has more KV regions ({len(nixl_agent_meta.kv_caches_base_addr)}) "
+            f"than local ({len(self.block_len_per_layer)})"
+        )
 
     def sync_recved_kv_to_device(self, req_id: str, meta: ReqMeta):
         """copy recved kv from host buffer to device."""
@@ -2584,9 +2637,18 @@ class NixlConnectorWorker:
 
     def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
         assert meta.remote is not None and self.kv_topo is not None
-        remote_ranks = self.kv_topo.get_target_remote_ranks_from_engine_id(
-            meta.remote.engine_id
-        )
+        if meta.pp_size > 1:
+            # PP Prefill: connect to all PP stages via global indices.
+            # Each PP stage has its own layer subset; per-range handles are used
+            # in _read_blocks to keep descriptor counts matching.
+            remote_tp_size = self._tp_size.get(meta.remote.engine_id, 1)
+            remote_ranks = self.kv_topo.get_all_pp_tp_targets(
+                remote_tp_size, meta.pp_size
+            )
+        else:
+            remote_ranks = self.kv_topo.get_target_remote_ranks_from_engine_id(
+                meta.remote.engine_id
+            )
         tp_ratio = self.kv_topo.tp_ratio_from_engine_id(meta.remote.engine_id)
         # D may have to perform multiple reads from different remote ranks.
         for i, remote_rank in enumerate(remote_ranks):
@@ -2616,6 +2678,12 @@ class NixlConnectorWorker:
                 local_xfer_side_handle = self.src_xfer_handles_by_block_size[
                     remote_block_size
                 ]
+
+            # PP layer-range routing: override local handle with the per-PP-rank
+            # slice so src/dst descriptor counts match in make_prepped_xfer.
+            pp_key = (meta.remote.engine_id, remote_rank)
+            if pp_key in self._pp_src_xfer_handles:
+                local_xfer_side_handle = self._pp_src_xfer_handles[pp_key]
 
             # Destination handle: remote_engine_id -> remote_rank -> handle.
             remote_xfer_side_handle = self.dst_xfer_side_handles[meta.remote.engine_id][
@@ -2982,6 +3050,9 @@ class NixlConnectorWorker:
             for dst_xfer_side_handle in dst_xfer_side_handles.values():
                 self.nixl_wrapper.release_dlist_handle(dst_xfer_side_handle)
         self.dst_xfer_side_handles.clear()
+        for handle in self._pp_src_xfer_handles.values():
+            self.nixl_wrapper.release_dlist_handle(handle)
+        self._pp_src_xfer_handles.clear()
         for remote_agents in self._remote_agents.values():
             for agent_name in remote_agents.values():
                 self.nixl_wrapper.remove_remote_agent(agent_name)
