@@ -1322,9 +1322,13 @@ class NixlConnectorWorker:
         else:
             p_remote_ranks = self.kv_topo.get_target_remote_ranks(remote_tp_size)
         remote_rank_to_agent_name = {}
-        # PP layer offset: tracks cumulative layer count across PP ranks so each
-        # PP rank's local src handle covers only the correct layer slice.
+        # PP layer offset: tracks cumulative layer count across PP stages so each
+        # PP stage's local src handle covers only the correct layer slice.
+        # Advances once per PP stage (not per TP rank): all TP workers in the same
+        # PP stage hold the same layers and should receive the same slice handle.
         pp_layer_offset = 0
+        pp_layer_last_stage = -1          # which PP stage owns the current offset
+        pp_layer_last_num_layers = 0      # layer count of the stage at last offset
         path = make_zmq_path("tcp", host, port)
 
         with zmq_ctx(zmq.REQ, path) as sock:
@@ -1427,6 +1431,20 @@ class NixlConnectorWorker:
                     )
                     regions_per_layer = self.num_regions // num_local_layers
                     num_pp_regions = num_pp_layers * regions_per_layer
+
+                    # Determine which PP stage this remote_rank belongs to.
+                    # global_rank = pp_stage * remote_tp_size + tp_rank_in_stage.
+                    pp_stage = remote_rank // remote_tp_size
+
+                    # Advance pp_layer_offset only when entering a NEW PP stage.
+                    # All TP workers in the same PP stage hold identical layers;
+                    # they all share the same layer-slice handle (same offset).
+                    if pp_stage != pp_layer_last_stage:
+                        if pp_layer_last_stage >= 0:
+                            pp_layer_offset += pp_layer_last_num_layers
+                        pp_layer_last_stage = pp_stage
+                        pp_layer_last_num_layers = num_pp_layers
+
                     self._pp_src_xfer_handles[(expected_engine_id, remote_rank)] = (
                         self._build_layer_range_xfer_handle(
                             pp_layer_offset, pp_layer_offset + num_pp_layers
@@ -1434,16 +1452,16 @@ class NixlConnectorWorker:
                         num_pp_regions,
                     )
                     logger.debug(
-                        "PP layer-range handle: rank=%d layers=[%d:%d] "
+                        "PP layer-range handle: rank=%d pp_stage=%d layers=[%d:%d] "
                         "regions_per_layer=%d num_pp_regions=%d key=%s",
                         remote_rank,
+                        pp_stage,
                         pp_layer_offset,
                         pp_layer_offset + num_pp_layers,
                         regions_per_layer,
                         num_pp_regions,
                         expected_engine_id,
                     )
-                    pp_layer_offset += num_pp_layers
             logger.info(
                 "[KV] handshake completed: engine=%s, %.3fs, %d ranks",
                 expected_engine_id,
@@ -2665,17 +2683,25 @@ class NixlConnectorWorker:
                 meta.remote.engine_id
             )
         tp_ratio = self.kv_topo.tp_ratio_from_engine_id(meta.remote.engine_id)
+
+        # n_tp_per_stage: how many consecutive entries in remote_ranks belong to
+        # the same PP stage.  get_all_pp_tp_targets returns:
+        #   outer loop = pp_stage (0..pp_size-1)
+        #   inner loop = tp_targets per stage (length = abs(tp_ratio) when < 0)
+        # For tp_ratio > 0 (or PP=1): each entry is its own "stage" of size 1.
+        n_tp_per_stage = (-tp_ratio) if tp_ratio < 0 else 1
+
         # D may have to perform multiple reads from different remote ranks.
         for i, remote_rank in enumerate(remote_ranks):
-            if self.use_mla and tp_ratio < 0 and i > 0 and meta.pp_size <= 1:
-                # MLA opt: when P TP > D TP, only a single read is executed for
-                # the first remote rank (cache is duplicated).
-                # Guard: meta.pp_size <= 1 prevents this break when PP > 1.
-                # With PP > 1, remote_ranks spans multiple PP stages (outer) ×
-                # TP ranks (inner); skipping at i=1 would drop PP stages 1..N.
-                # TODO: for PP > 1 with P.TP > D.TP (MLA), restructure to apply
-                # the skip per-PP-stage rather than globally across the flat loop.
-                break
+            # Position of this rank within its PP stage's TP group.
+            i_in_stage = i % n_tp_per_stage
+
+            if self.use_mla and tp_ratio < 0 and i_in_stage > 0:
+                # MLA opt: when P.TP > D.TP, KV is replicated across P TP ranks.
+                # Read only from the first TP rank of each PP stage (i_in_stage=0);
+                # notify the skipped ranks so Prefill can release their blocks.
+                # Use `continue` (not break) so all PP stages are processed.
+                continue
 
             remote_block_size = self.kv_topo.remote_block_size[meta.remote.engine_id]
             logger.debug(
@@ -2691,7 +2717,10 @@ class NixlConnectorWorker:
                 assert remote_block_size == self.block_size
                 # Remote tp_size > local tp_size: we must perform multiple
                 # reads. Get the memory chunk onto which we will write to.
-                local_xfer_side_handle = self.src_xfer_handles_by_tp_ratio[tp_ratio][i]
+                # Use i_in_stage (not i) so the handle index resets per PP stage.
+                local_xfer_side_handle = self.src_xfer_handles_by_tp_ratio[tp_ratio][
+                    i_in_stage
+                ]
             else:
                 # Single read from remote, we write to the whole memory region.
                 # Also handle remote block size different from local block size.
@@ -2728,16 +2757,22 @@ class NixlConnectorWorker:
             )
 
             if self.use_mla and tp_ratio < 0:
-                # ..but we still need to notify the other remote ranks that we
-                # have the blocks we need so they can update the request state.
+                # After reading from the first TP rank of this PP stage, notify
+                # the skipped TP ranks within the SAME stage so Prefill can
+                # release their blocks.  Only notify stage-peers (i+1..i+n-1),
+                # NOT ranks from other PP stages (those get their own reads).
                 # NOTE: must use meta.remote.request_id (prefill-side ID), not
                 # req_id (decode-side ID). In Dynamo KVBM mode these share the
                 # same base UUID but carry different hash suffixes.
                 notif_id = f"{meta.remote.request_id}:{self.world_size}".encode()
                 remote_agents = self._remote_agents[meta.remote.engine_id]
-                for rank_to_notify, agent in remote_agents.items():
-                    if rank_to_notify != remote_rank:
-                        self.nixl_wrapper.send_notif(agent, notif_msg=notif_id)
+                for j in range(1, n_tp_per_stage):
+                    skipped_idx = i + j
+                    if skipped_idx < len(remote_ranks):
+                        skipped_rank = remote_ranks[skipped_idx]
+                        agent = remote_agents.get(skipped_rank)
+                        if agent is not None:
+                            self.nixl_wrapper.send_notif(agent, notif_msg=notif_id)
 
     def _read_blocks(
         self,

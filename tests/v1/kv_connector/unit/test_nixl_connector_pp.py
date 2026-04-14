@@ -862,30 +862,32 @@ class TestBuildLayerRangeXferHandleStride:
 
 
 # ===========================================================================
-# Tests: MLA tp_ratio < 0 break guard when PP > 1 (latent bug fix)
+# Tests: MLA tp_ratio < 0 loop restructure for PP > 1 (full fix)
 # ===========================================================================
 
-class TestMlaTpRatioBreakPPGuard:
+class TestMlaPerStageTpOptimization:
     """
-    The MLA optimization `if use_mla and tp_ratio < 0 and i > 0: break`
-    was designed for PP=1 with P.TP > D.TP (KV replicated across P TP ranks,
-    so D only reads from rank 0 and notifies the rest).
+    Full fix for MLA optimization when PP > 1 and P.TP > D.TP.
 
-    Without the `meta.pp_size <= 1` guard, the break fires at i=1 even when
-    PP > 1, skipping PP stages 1..N entirely.
+    Root cause of original bug: the flat loop used `break` at `i > 0`, which
+    dropped all PP stages 1..N when tp_ratio < 0 (P.TP > D.TP).
 
-    Scenario: PP4+TP4 Prefill + D.TP=1 (MLA, tp_ratio=-4)
-      get_all_pp_tp_targets(4, 4) = [0,1,2,3, 4,5,6,7, 8,9,10,11, 12,13,14,15]
-      Without guard: break at i=1 → only rank 0 (PP stage 0) processed.
-      With guard (pp_size=4 > 1): all 16 ranks processed.
+    Fix: use `continue` (not `break`) at `i_in_stage > 0`, where
+    `i_in_stage = i % n_tp_per_stage` and `n_tp_per_stage = abs(tp_ratio)`.
 
-    Current setup (PP4+TP1 Prefill) is unaffected (tp_ratio=+1, guard irrelevant).
-    These tests document the invariant and guard logic.
+    This correctly:
+    - Skips non-first TP ranks WITHIN each PP stage (MLA: KV replicated)
+    - Processes ALL PP stages (reads from first TP rank of each)
+    - Sends per-stage notifications (only to skipped TP ranks of the same stage)
+
+    Handshake fix: pp_layer_offset advances per PP stage, not per TP rank.
+    All TP ranks in the same PP stage receive the same layer-slice handle.
+
+    Current setup (PP4+TP1 Prefill, tp_ratio=+1) is unaffected.
     """
 
     @staticmethod
     def _tp_ratio(local_tp: int, remote_tp: int) -> int:
-        """Replicate TpKVTopology.tp_ratio logic."""
         if local_tp >= remote_tp:
             return local_tp // remote_tp
         return -(remote_tp // local_tp)
@@ -893,8 +895,7 @@ class TestMlaTpRatioBreakPPGuard:
     @staticmethod
     def _get_all_pp_tp_targets(d_tp_rank: int, d_tp_size: int,
                                 remote_tp_size: int, remote_pp_size: int):
-        """Replicate get_all_pp_tp_targets logic."""
-        tp_ratio = TestMlaTpRatioBreakPPGuard._tp_ratio(d_tp_size, remote_tp_size)
+        tp_ratio = TestMlaPerStageTpOptimization._tp_ratio(d_tp_size, remote_tp_size)
         if tp_ratio > 0:
             tp_targets = [d_tp_rank // tp_ratio]
         else:
@@ -904,67 +905,182 @@ class TestMlaTpRatioBreakPPGuard:
                 for pp in range(remote_pp_size)
                 for tr in tp_targets]
 
-    def _simulate_loop(self, remote_ranks, tp_ratio, use_mla, pp_size):
-        """Simulate _read_blocks_for_req loop, return list of processed ranks."""
-        processed = []
+    @staticmethod
+    def _simulate_loop(remote_ranks, tp_ratio, use_mla):
+        """
+        Simulate _read_blocks_for_req fixed loop.
+        Returns (reads, notifications) where:
+          reads         = list of remote_ranks that trigger _read_blocks
+          notifications = list of (from_rank, to_rank) notif pairs
+        """
+        n_tp_per_stage = (-tp_ratio) if tp_ratio < 0 else 1
+        reads = []
+        notifications = []
         for i, rank in enumerate(remote_ranks):
-            if use_mla and tp_ratio < 0 and i > 0 and pp_size <= 1:
-                break  # current guard: only fires when pp_size == 1
-            processed.append(rank)
-        return processed
+            i_in_stage = i % n_tp_per_stage
+            if use_mla and tp_ratio < 0 and i_in_stage > 0:
+                continue  # skip non-first TP rank within PP stage
+            reads.append(rank)
+            if use_mla and tp_ratio < 0:
+                # notify skipped TP ranks within THIS PP stage only
+                for j in range(1, n_tp_per_stage):
+                    skipped_idx = i + j
+                    if skipped_idx < len(remote_ranks):
+                        notifications.append((rank, remote_ranks[skipped_idx]))
+        return reads, notifications
 
-    def test_pp1_tp1_tp1_ratio_positive_no_break(self):
-        """PP4+TP1 Prefill + D.TP=1: tp_ratio=+1, break never fires."""
-        tp_ratio = self._tp_ratio(local_tp=1, remote_tp=1)
-        assert tp_ratio == 1  # positive
+    @staticmethod
+    def _simulate_handshake_offsets(remote_ranks, remote_tp_size,
+                                     pp_layer_counts):
+        """
+        Simulate _nixl_handshake pp_layer_offset assignment.
+        pp_layer_counts: dict {pp_stage: num_layers} or list indexed by pp_stage.
+        Returns dict {remote_rank: (start_layer, end_layer)}.
+        """
+        pp_layer_offset = 0
+        pp_layer_last_stage = -1
+        pp_layer_last_num_layers = 0
+        result = {}
+        for remote_rank in remote_ranks:
+            pp_stage = remote_rank // remote_tp_size
+            num_pp_layers = (pp_layer_counts[pp_stage]
+                             if isinstance(pp_layer_counts, list)
+                             else pp_layer_counts[pp_stage])
+            if pp_stage != pp_layer_last_stage:
+                if pp_layer_last_stage >= 0:
+                    pp_layer_offset += pp_layer_last_num_layers
+                pp_layer_last_stage = pp_stage
+                pp_layer_last_num_layers = num_pp_layers
+            result[remote_rank] = (pp_layer_offset, pp_layer_offset + num_pp_layers)
+        return result
 
+    # ── loop behavior tests ──────────────────────────────────────────────────
+
+    def test_pp4_tp1_all_stages_read(self):
+        """PP4+TP1 Prefill + D.TP=1: tp_ratio=+1, all 4 PP stages read."""
+        tp_ratio = self._tp_ratio(1, 1)
         remote_ranks = self._get_all_pp_tp_targets(0, 1, 1, 4)
-        assert remote_ranks == [0, 1, 2, 3]  # one rank per PP stage
+        assert remote_ranks == [0, 1, 2, 3]
 
-        processed = self._simulate_loop(remote_ranks, tp_ratio, use_mla=True, pp_size=4)
-        assert processed == [0, 1, 2, 3], "All 4 PP stages must be processed"
+        reads, notifs = self._simulate_loop(remote_ranks, tp_ratio, use_mla=True)
+        assert reads == [0, 1, 2, 3], "All PP stages must trigger a read"
+        assert notifs == [], "No notifications: tp_ratio > 0"
 
-    def test_pp4_tp4_prefill_d_tp1_without_guard_breaks_early(self):
-        """Bug: PP4+TP4 Prefill + D.TP=1, WITHOUT pp_size guard → break at i=1."""
-        tp_ratio = self._tp_ratio(local_tp=1, remote_tp=4)
-        assert tp_ratio == -4  # negative: P.TP > D.TP
-
+    def test_pp4_tp4_prefill_d_tp1_mla_reads_one_per_stage(self):
+        """PP4+TP4 Prefill + D.TP=1 (MLA, tp_ratio=-4): reads first TP rank per stage."""
+        tp_ratio = self._tp_ratio(1, 4)
+        assert tp_ratio == -4
         remote_ranks = self._get_all_pp_tp_targets(0, 1, 4, 4)
-        assert len(remote_ranks) == 16  # 4 TP ranks × 4 PP stages
+        assert remote_ranks == list(range(16))
 
-        # Simulate OLD behavior (no pp_size guard)
-        processed_old = []
+        reads, notifs = self._simulate_loop(remote_ranks, tp_ratio, use_mla=True)
+        # Exactly one read per PP stage (ranks 0, 4, 8, 12)
+        assert reads == [0, 4, 8, 12], f"Expected first TP rank of each PP stage, got {reads}"
+
+    def test_pp4_tp4_prefill_d_tp1_mla_notifications_per_stage(self):
+        """PP4+TP4 Prefill + D.TP=1 (MLA): notifications sent only within each stage."""
+        tp_ratio = self._tp_ratio(1, 4)
+        remote_ranks = self._get_all_pp_tp_targets(0, 1, 4, 4)
+        _, notifs = self._simulate_loop(remote_ranks, tp_ratio, use_mla=True)
+
+        # Expected: from rank 0 → notify 1,2,3; from 4 → 5,6,7; etc.
+        expected = [(0,1),(0,2),(0,3), (4,5),(4,6),(4,7),
+                    (8,9),(8,10),(8,11), (12,13),(12,14),(12,15)]
+        assert notifs == expected, f"Unexpected notifications: {notifs}"
+        # No cross-stage notifications (e.g. rank 0 should NOT notify rank 4)
+        for (src, dst) in notifs:
+            assert src // 4 == dst // 4, f"Cross-stage notif: {src}→{dst}"
+
+    def test_old_break_at_i1_documents_original_bug(self):
+        """Document original bug: break at i=1 drops PP stages 1-3."""
+        tp_ratio = self._tp_ratio(1, 4)
+        remote_ranks = self._get_all_pp_tp_targets(0, 1, 4, 4)
+        # OLD behavior (break at i>0)
+        old_reads = []
         for i, rank in enumerate(remote_ranks):
-            if True and tp_ratio < 0 and i > 0:  # old: no pp_size check
+            if tp_ratio < 0 and i > 0:
                 break
-            processed_old.append(rank)
-        assert processed_old == [0], "Without guard: only rank 0 processed → BUG"
+            old_reads.append(rank)
+        assert old_reads == [0], "Bug confirmed: old code reads only rank 0"
 
-    def test_pp4_tp4_prefill_d_tp1_with_guard_processes_all_stages(self):
-        """Fix: with pp_size guard (pp_size=4 > 1), break disabled → all 16 ranks."""
-        tp_ratio = self._tp_ratio(local_tp=1, remote_tp=4)
-        remote_ranks = self._get_all_pp_tp_targets(0, 1, 4, 4)
+    def test_pp1_mla_tp_ratio_negative_still_reads_only_rank0(self):
+        """PP=1 (no PP), MLA, P.TP=4 > D.TP=1: reads rank 0, notifies 1,2,3."""
+        tp_ratio = self._tp_ratio(1, 4)
+        remote_ranks = self._get_all_pp_tp_targets(0, 1, 4, 1)
+        assert remote_ranks == [0, 1, 2, 3]
 
-        processed = self._simulate_loop(remote_ranks, tp_ratio, use_mla=True, pp_size=4)
-        assert len(processed) == 16, (
-            f"With pp_size=4 guard: all 16 ranks must be processed, got {len(processed)}"
-        )
-        assert processed == list(range(16))
+        reads, notifs = self._simulate_loop(remote_ranks, tp_ratio, use_mla=True)
+        assert reads == [0], "PP=1 MLA opt: only rank 0 read"
+        assert notifs == [(0, 1), (0, 2), (0, 3)], "Notify all skipped TP ranks"
 
-    def test_pp1_mla_tp_ratio_negative_break_still_works(self):
-        """PP=1 (no PP), MLA, P.TP=4 > D.TP=1: break still fires at i=1."""
-        tp_ratio = self._tp_ratio(local_tp=1, remote_tp=4)
-        remote_ranks = self._get_all_pp_tp_targets(0, 1, 4, 1)  # pp=1
-        assert remote_ranks == [0, 1, 2, 3]  # 4 P TP ranks, pp=1
-
-        processed = self._simulate_loop(remote_ranks, tp_ratio, use_mla=True, pp_size=1)
-        assert processed == [0], "PP=1 MLA opt: break at i=1, only rank 0 read (correct)"
-
-    def test_current_setup_unaffected(self):
-        """PP4+TP1 Prefill (our setup): tp_ratio=1 always, guard is irrelevant."""
-        # D.TP=1, D.TP=2, D.TP=4 — all give tp_ratio > 0 when P.TP=1
+    def test_current_setup_tp_ratio_always_positive(self):
+        """PP4+TP1 Prefill: tp_ratio always positive, optimization never fires."""
         for d_tp in [1, 2, 4]:
-            ratio = self._tp_ratio(local_tp=d_tp, remote_tp=1)
-            assert ratio > 0, f"D.TP={d_tp}, P.TP=1 should always be positive"
-            # Verify: break condition `tp_ratio < 0` is always False
-            assert not (ratio < 0)
+            ratio = self._tp_ratio(d_tp, 1)
+            assert ratio > 0
+            n_tp_per_stage = (-ratio) if ratio < 0 else 1
+            assert n_tp_per_stage == 1  # no per-stage grouping needed
+
+    # ── handshake layer offset tests ─────────────────────────────────────────
+
+    def test_handshake_pp4_tp1_offsets_per_stage(self):
+        """PP4+TP1: 4 remote_ranks → each advances pp_layer_offset by 7 (last=6)."""
+        remote_tp_size = 1
+        remote_ranks = [0, 1, 2, 3]
+        layer_counts = [7, 7, 7, 6]  # PP0..PP3
+
+        offsets = self._simulate_handshake_offsets(
+            remote_ranks, remote_tp_size, layer_counts)
+
+        assert offsets[0] == (0, 7)
+        assert offsets[1] == (7, 14)
+        assert offsets[2] == (14, 21)
+        assert offsets[3] == (21, 27)
+
+    def test_handshake_pp4_tp4_all_tp_ranks_same_stage_same_offset(self):
+        """PP4+TP4: all 4 TP ranks of the same PP stage share the same offset."""
+        remote_tp_size = 4
+        remote_ranks = list(range(16))
+        layer_counts = [7, 7, 7, 6]  # per PP stage
+
+        offsets = self._simulate_handshake_offsets(
+            remote_ranks, remote_tp_size, layer_counts)
+
+        # PP stage 0: global ranks 0-3, all layers [0:7]
+        for rank in [0, 1, 2, 3]:
+            assert offsets[rank] == (0, 7), f"rank {rank}: {offsets[rank]}"
+        # PP stage 1: global ranks 4-7, all layers [7:14]
+        for rank in [4, 5, 6, 7]:
+            assert offsets[rank] == (7, 14), f"rank {rank}: {offsets[rank]}"
+        # PP stage 2: global ranks 8-11, all layers [14:21]
+        for rank in [8, 9, 10, 11]:
+            assert offsets[rank] == (14, 21), f"rank {rank}: {offsets[rank]}"
+        # PP stage 3: global ranks 12-15, all layers [21:27]
+        for rank in [12, 13, 14, 15]:
+            assert offsets[rank] == (21, 27), f"rank {rank}: {offsets[rank]}"
+
+    def test_handshake_old_per_rank_advance_was_wrong(self):
+        """Document original bug: advancing per-rank gives wrong offsets for PP4+TP4."""
+        remote_tp_size = 4
+        remote_ranks = list(range(16))
+        num_pp_layers = 7  # constant for simplicity
+
+        # OLD: advance per remote_rank
+        old_offsets = {}
+        pp_layer_offset = 0
+        for rank in remote_ranks:
+            old_offsets[rank] = (pp_layer_offset, pp_layer_offset + num_pp_layers)
+            pp_layer_offset += num_pp_layers  # ← wrong: advances every rank
+
+        # PP0 TP0 → correct [0:7]; PP0 TP1 → wrong [7:14] instead of [0:7]
+        assert old_offsets[0] == (0, 7)   # PP0 TP0 accidentally correct
+        assert old_offsets[1] == (7, 14)  # PP0 TP1 WRONG (should be [0:7])
+        assert old_offsets[4] == (28, 35) # PP1 TP0 WRONG (should be [7:14])
+
+        # NEW: advance per PP stage — these are correct
+        layer_counts = {s: num_pp_layers for s in range(4)}
+        new_offsets = self._simulate_handshake_offsets(
+            remote_ranks, remote_tp_size, layer_counts)
+        assert new_offsets[0] == (0, 7)
+        assert new_offsets[1] == (0, 7)   # same stage as rank 0
+        assert new_offsets[4] == (7, 14)  # PP1 correct
