@@ -2194,7 +2194,13 @@ class NixlConnectorWorker:
         remote_block_len = nixl_agent_meta.block_lens[0]
         if self.use_mla or self.kv_topo.is_kv_replicated(remote_engine_id):
             # With replicated KV cache, only the number of blocks can differ.
-            for i in range(len(self.block_len_per_layer)):
+            # With Pipeline Parallelism on the remote (Prefill), each PP rank
+            # only registers its own layer subset, so block_lens has fewer
+            # entries than local block_len_per_layer. Validate the overlap only.
+            num_layers_to_check = min(
+                len(self.block_len_per_layer), len(nixl_agent_meta.block_lens)
+            )
+            for i in range(num_layers_to_check):
                 assert (
                     self.block_len_per_layer[i] // block_size_ratio
                     == nixl_agent_meta.block_lens[i]
