@@ -1196,9 +1196,9 @@ class NixlConnectorWorker:
         self._registered_descs: list[Any] = []
 
         # PP-aware layer-range src handles: (engine_id, global_pp_rank) ->
-        # nixl_prepped_dlist_handle covering only that PP rank's layer subset.
-        # Built during _nixl_handshake when remote_pp_size > 1.
-        self._pp_src_xfer_handles: dict[tuple[EngineId, int], int] = {}
+        # (nixl_prepped_dlist_handle, num_pp_layers) covering only that PP rank's
+        # layer subset. Built during _nixl_handshake when remote_pp_size > 1.
+        self._pp_src_xfer_handles: dict[tuple[EngineId, int], tuple[int, int]] = {}
 
         # In progress transfers.
         # [req_id -> list[handle]]
@@ -1423,7 +1423,8 @@ class NixlConnectorWorker:
                     self._pp_src_xfer_handles[(expected_engine_id, remote_rank)] = (
                         self._build_layer_range_xfer_handle(
                             pp_layer_offset, pp_layer_offset + num_pp_layers
-                        )
+                        ),
+                        num_pp_layers,
                     )
                     logger.debug(
                         "PP layer-range handle: rank=%d layers=[%d:%d] key=%s",
@@ -2681,9 +2682,14 @@ class NixlConnectorWorker:
 
             # PP layer-range routing: override local handle with the per-PP-rank
             # slice so src/dst descriptor counts match in make_prepped_xfer.
+            # Also record num_pp_layers so _get_block_descs_ids uses the right
+            # num_regions for the slice handle instead of the full model layers.
             pp_key = (meta.remote.engine_id, remote_rank)
+            pp_local_num_layers: int | None = None
             if pp_key in self._pp_src_xfer_handles:
-                local_xfer_side_handle = self._pp_src_xfer_handles[pp_key]
+                local_xfer_side_handle, pp_local_num_layers = (
+                    self._pp_src_xfer_handles[pp_key]
+                )
 
             # Destination handle: remote_engine_id -> remote_rank -> handle.
             remote_xfer_side_handle = self.dst_xfer_side_handles[meta.remote.engine_id][
@@ -2698,6 +2704,7 @@ class NixlConnectorWorker:
                 remote_rank=remote_rank,
                 local_xfer_side_handle=local_xfer_side_handle,
                 remote_xfer_side_handle=remote_xfer_side_handle,
+                local_num_layers=pp_local_num_layers,
             )
 
             if self.use_mla and tp_ratio < 0:
@@ -2722,6 +2729,7 @@ class NixlConnectorWorker:
         remote_rank: int,
         local_xfer_side_handle: int,
         remote_xfer_side_handle: int,
+        local_num_layers: int | None = None,
     ):
         """
         Post a READ point-to-point xfer request from a single local worker to
@@ -2815,6 +2823,10 @@ class NixlConnectorWorker:
             self.engine_id,
             local_block_ids,
             block_size_ratio=block_size_ratio,
+            # PP: slice handle covers only num_pp_layers regions; use that count
+            # instead of self.num_regions (full model layers) to keep indices
+            # within the slice handle's descriptor range.
+            num_regions_override=local_num_layers,
         )
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
@@ -2889,13 +2901,18 @@ class NixlConnectorWorker:
         engine_id: str,
         block_ids: BlockIds,
         block_size_ratio: float | None = None,
+        num_regions_override: int | None = None,
     ) -> np.ndarray:
         """
         Get the descs ids for a set of block ids.
         When HMA is enabled number of descriptors across kv cache groups might differ.
         A single flattened array is returned for all groups anyway.
+
+        num_regions_override: when set, use this value instead of self.num_regions.
+        Used for PP slice handles that cover only a subset of model layers.
         """
-        region_ids = np.arange(self.num_regions)
+        num_regions = num_regions_override if num_regions_override is not None else self.num_regions
+        region_ids = np.arange(num_regions)
 
         # NOTE (NickLucche) With HMA, every kv group has the same number of layers and
         # layers from different groups share the same kv tensor.
@@ -2926,7 +2943,7 @@ class NixlConnectorWorker:
             ratio = self._physical_blocks_per_logical_kv_block
             # SSM may register fewer num_blocks than FA
             logical_blocks = num_blocks // ratio
-            num_fa_descs = self.num_regions * num_blocks
+            num_fa_descs = num_regions * num_blocks
             all_descs = []
             for i, group in enumerate(block_ids):
                 stride = logical_blocks if self._is_mamba_group[i] else num_blocks
@@ -3050,7 +3067,7 @@ class NixlConnectorWorker:
             for dst_xfer_side_handle in dst_xfer_side_handles.values():
                 self.nixl_wrapper.release_dlist_handle(dst_xfer_side_handle)
         self.dst_xfer_side_handles.clear()
-        for handle in self._pp_src_xfer_handles.values():
+        for handle, _ in self._pp_src_xfer_handles.values():
             self.nixl_wrapper.release_dlist_handle(handle)
         self._pp_src_xfer_handles.clear()
         for remote_agents in self._remote_agents.values():

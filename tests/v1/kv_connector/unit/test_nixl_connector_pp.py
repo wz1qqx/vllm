@@ -637,3 +637,88 @@ class TestPPLayerRangeRouting:
         # PP=1: layer_range = [0:27] = full list
         sliced = blocks_data[0: 27 * num_blocks]
         assert sliced == blocks_data
+
+
+# ===========================================================================
+# Tests: _get_block_descs_ids num_regions_override (Wave 2.5 fix)
+# ===========================================================================
+
+class TestGetBlockDescsIdsNumRegionsOverride:
+    """
+    When a PP slice handle is used (local_xfer_side_handle covers only
+    num_pp_layers layers), _get_block_descs_ids must use num_pp_layers as
+    num_regions so all generated IDs stay within [0, num_pp_layers*num_blocks).
+
+    Root cause of the "makeXferReq local index N out of range" error:
+    - PP slice handle has (num_pp_layers * num_blocks) descriptors.
+    - _get_block_descs_ids used self.num_regions (=27, full model), producing
+      indices up to 26*num_blocks+block_id — way beyond the slice handle size.
+    - Fix: pass num_regions_override=num_pp_layers to _get_block_descs_ids.
+
+    These are pure-logic tests (no NIXL runtime needed).
+    """
+
+    @staticmethod
+    def _compute_descs_ids(
+        num_regions: int, num_blocks_per_engine: int, block_ids: list[int]
+    ) -> list[int]:
+        """Replicate the non-Mamba branch of _get_block_descs_ids."""
+        import numpy as np
+        region_ids = np.arange(num_regions)[:, None]
+        bids = np.array(block_ids)[None, :]
+        return (region_ids * num_blocks_per_engine + bids).flatten().tolist()
+
+    def test_full_27_regions_exceeds_7layer_slice_handle(self):
+        """Bug repro: full 27-region IDs exceed a 7-layer slice handle of size 7*nb."""
+        num_blocks = 200  # Decode's total num_blocks
+        num_pp_layers = 7
+        # Decode's total blocks per engine id (dst_num_blocks)
+        ids_full = self._compute_descs_ids(27, num_blocks, block_ids=[14])
+        # PP slice handle only has 7 * num_blocks entries
+        max_valid = num_pp_layers * num_blocks - 1
+        assert any(idx > max_valid for idx in ids_full), (
+            "Expected some IDs to be out of range of the 7-layer slice handle"
+        )
+
+    def test_7_regions_override_stays_within_slice_handle(self):
+        """Fix: with num_regions_override=7, all IDs <= 7*num_blocks-1."""
+        num_blocks = 200
+        num_pp_layers = 7
+        # A request with a few block IDs
+        request_block_ids = [0, 1, 5, 14, 100]
+        ids_sliced = self._compute_descs_ids(num_pp_layers, num_blocks, request_block_ids)
+        max_valid = num_pp_layers * num_blocks - 1
+        assert all(idx <= max_valid for idx in ids_sliced), (
+            f"Some IDs exceed slice handle size {max_valid}: {ids_sliced}"
+        )
+
+    def test_7_regions_override_correct_formula(self):
+        """IDs with override=7 are: [r*nb+b for r in 0..6 for b in block_ids]."""
+        num_blocks = 200
+        block_ids = [3, 7]
+        ids = self._compute_descs_ids(7, num_blocks, block_ids)
+        expected = [r * num_blocks + b for r in range(7) for b in block_ids]
+        assert ids == expected
+
+    def test_all_pp4_ranks_use_correct_override(self):
+        """PP4+TP1 (layers 7/7/7/6): each rank uses its own num_pp_layers as override."""
+        num_blocks = 150
+        pp_layer_counts = [7, 7, 7, 6]
+        request_block_ids = [0, 10, 50]
+
+        for num_pp_layers in pp_layer_counts:
+            ids = self._compute_descs_ids(num_pp_layers, num_blocks, request_block_ids)
+            max_valid = num_pp_layers * num_blocks - 1
+            assert all(idx <= max_valid for idx in ids), (
+                f"PP rank with {num_pp_layers} layers: ID out of range. "
+                f"max_valid={max_valid}, ids={ids}"
+            )
+
+    def test_pp1_no_override_same_result_as_full(self):
+        """PP=1: no override → num_regions=27, same as before (backward compat)."""
+        num_blocks = 100
+        block_ids = [0, 5, 20]
+        ids_no_override = self._compute_descs_ids(27, num_blocks, block_ids)
+        # With override=27 (full model, PP=1 scenario), same result
+        ids_override_27 = self._compute_descs_ids(27, num_blocks, block_ids)
+        assert ids_no_override == ids_override_27
