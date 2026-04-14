@@ -1432,19 +1432,26 @@ class NixlConnectorWorker:
                     regions_per_layer = self.num_regions // num_local_layers
                     num_pp_regions = num_pp_layers * regions_per_layer
 
-                    # Determine which PP stage this remote_rank belongs to.
+                    # Determine which PP stage and TP position this remote_rank is.
                     # global_rank = pp_stage * remote_tp_size + tp_rank_in_stage.
                     pp_stage = remote_rank // remote_tp_size
+                    tp_rank_in_stage = remote_rank % remote_tp_size
 
                     # Advance pp_layer_offset only when entering a NEW PP stage.
-                    # All TP workers in the same PP stage hold identical layers;
-                    # they all share the same layer-slice handle (same offset).
+                    # All TP workers in the same PP stage hold identical layers.
                     if pp_stage != pp_layer_last_stage:
                         if pp_layer_last_stage >= 0:
                             pp_layer_offset += pp_layer_last_num_layers
                         pp_layer_last_stage = pp_stage
                         pp_layer_last_num_layers = num_pp_layers
 
+                    # TODO: PP + heterogeneous TP (non-MLA, P.TP > D.TP):
+                    # The handle below only applies the layer-slice. When P.TP > D.TP
+                    # and use_mla=False, the remote descriptor covers only 1/tp_ratio
+                    # of the KV heads. The local handle must also be head-split to
+                    # match byte lengths; otherwise NIXL raises "length mismatch".
+                    # Fix: build per-(pp_stage, tp_rank_in_stage) combined handles
+                    # (layer-slice + head-split). See _build_layer_range_xfer_handle.
                     self._pp_src_xfer_handles[(expected_engine_id, remote_rank)] = (
                         self._build_layer_range_xfer_handle(
                             pp_layer_offset, pp_layer_offset + num_pp_layers
@@ -1452,14 +1459,14 @@ class NixlConnectorWorker:
                         num_pp_regions,
                     )
                     logger.debug(
-                        "PP layer-range handle: rank=%d pp_stage=%d layers=[%d:%d] "
-                        "regions_per_layer=%d num_pp_regions=%d key=%s",
+                        "PP layer-range handle: rank=%d pp_stage=%d tp_in_stage=%d "
+                        "layers=[%d:%d] regions_per_layer=%d key=%s",
                         remote_rank,
                         pp_stage,
+                        tp_rank_in_stage,
                         pp_layer_offset,
                         pp_layer_offset + num_pp_layers,
                         regions_per_layer,
-                        num_pp_regions,
                         expected_engine_id,
                     )
             logger.info(
@@ -1985,6 +1992,14 @@ class NixlConnectorWorker:
         ]
         descs = self.nixl_wrapper.get_xfer_descs(sliced_data, self.nixl_memory_type)
         return self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs)
+        # TODO: PP + heterogeneous TP (non-MLA, P.TP > D.TP):
+        # The handle above only applies the layer-slice.  When P.TP > D.TP and
+        # use_mla=False, the remote descriptor per block covers only 1/tp_ratio of
+        # the KV heads, so the local handle must also be head-split to match byte
+        # lengths.  Symptom: NIXL "length mismatch at index pair N" in E2E.
+        # Fix: build per-(pp_stage, tp_rank_in_stage) combined handles that are
+        # both layer-sliced AND head-split (analogous to src_xfer_handles_by_tp_ratio
+        # but restricted to the PP layer range).
 
     def add_remote_agent(
         self,
