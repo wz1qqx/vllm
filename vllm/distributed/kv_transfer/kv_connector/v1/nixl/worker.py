@@ -1977,21 +1977,22 @@ class NixlConnectorWorker:
         tp_ratio = self.transfer_topo.tp_ratio(remote_tp_size)
         remote_pp_size = meta.pp_size
 
-        if remote_pp_size > 1:
-            if self.use_mla and tp_ratio < 0:
-                # MLA: all TP ranks within a PP stage hold identical KV.
-                # Pick only the first TP rank per PP stage and notify the rest.
-                first_tp = self.transfer_topo.handshake_target_ranks(remote_tp_size)[0]
-                remote_ranks = [
-                    first_tp + pp_rank * remote_tp_size
-                    for pp_rank in range(remote_pp_size)
-                ]
-            else:
-                # Expand to all PP stages × appropriate TP ranks.
-                remote_ranks = self.transfer_topo.get_all_pp_tp_targets(
-                    remote_tp_size=remote_tp_size,
-                    remote_pp_size=remote_pp_size,
-                )
+        if self.use_mla and tp_ratio < 0:
+            # MLA KV is replicated across TP ranks within each PP stage. When
+            # prefill TP is larger than decode TP, read from only one prefill
+            # TP rank per PP stage and notify the skipped ranks below so their
+            # producer-side blocks can be released.
+            first_tp = self.transfer_topo.handshake_target_ranks(remote_tp_size)[0]
+            remote_ranks = [
+                first_tp + pp_rank * remote_tp_size
+                for pp_rank in range(remote_pp_size)
+            ]
+        elif remote_pp_size > 1:
+            # Expand to all PP stages × appropriate TP ranks.
+            remote_ranks = self.transfer_topo.get_all_pp_tp_targets(
+                remote_tp_size=remote_tp_size,
+                remote_pp_size=remote_pp_size,
+            )
         else:
             remote_ranks = self.transfer_topo.target_remote_ranks(engine_id)
 
@@ -2064,7 +2065,7 @@ class NixlConnectorWorker:
             if self.use_mla and tp_ratio < 0:
                 # We only read from the first TP rank per PP stage; notify the
                 # other TP ranks in the SAME PP stage so they can release blocks.
-                notif_id = f"{req_id}:{self.world_size}".encode()
+                notif_id = f"{meta.remote.request_id}:{self.world_size}".encode()
                 remote_agents = self._remote_agents[meta.remote.engine_id]
                 pp_stage = remote_rank // remote_tp_size
                 for rank_to_notify, agent in remote_agents.items():

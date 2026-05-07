@@ -40,6 +40,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlKVConnectorStats,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    RemoteMeta,
     compute_nixl_compatibility_hash,
 )
 from vllm.distributed.kv_transfer.kv_transfer_state import (
@@ -875,6 +876,102 @@ class TestNixlHandshake:
         assert req_id not in conn_p0.connector_worker._reqs_to_process
         assert req_id not in conn_p1.connector_worker._reqs_to_send
         assert req_id not in conn_p1.connector_worker._reqs_to_process
+
+    @patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker.NixlWrapper",
+        FakeNixlWrapper,
+    )
+    def test_mla_prefill_tp_gt_decode_tp_reads_once_and_notifies_prefill_req(
+        self, default_vllm_config, dist_init, monkeypatch
+    ):
+        """
+        MLA KV is replicated across prefill TP ranks. For P.TP=8, D.TP=1,
+        decode should read one P rank and notify the skipped P ranks using
+        the producer-side request id, not the decode-side request id.
+        """
+        monkeypatch.setattr(
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker.get_tensor_model_parallel_world_size",
+            lambda: 1,
+        )
+        monkeypatch.setattr(
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker.get_tensor_model_parallel_rank",
+            lambda: 0,
+        )
+
+        vllm_config = create_vllm_config()
+        connector = NixlConnector(
+            vllm_config, KVConnectorRole.WORKER, make_kv_cache_config(block_size=16)
+        )
+        connector.connector_worker = FakeNixlConnectorWorker(
+            vllm_config, connector.engine_id, hand_shake_latency=0
+        )
+        worker = connector.connector_worker
+        worker.use_mla = True
+        worker.transfer_topo.is_mla = True
+        worker.world_size = 1
+        worker.tp_rank = 0
+        worker.block_len_per_layer = [4096 * worker.block_size]
+        worker.num_blocks = 1
+        worker.dst_num_blocks[worker.engine_id] = worker.num_blocks
+        worker.src_xfer_handles_by_block_size = {worker.block_size: 123}
+
+        remote_engine_id = worker.REMOTE_ENGINE_ID
+        remote_tp_size = 8
+        worker.transfer_topo.register_remote_engine(
+            remote_engine_id=remote_engine_id,
+            remote_tp_size=remote_tp_size,
+            remote_block_size=worker.block_size,
+            remote_block_len=worker.block_len_per_layer[0],
+            remote_physical_blocks_per_logical=1,
+            local_block_len=worker.block_len_per_layer[0],
+        )
+        worker.dst_num_blocks[remote_engine_id] = worker.num_blocks
+        worker.kv_caches_base_addr[remote_engine_id] = {
+            rank: [0] for rank in range(remote_tp_size)
+        }
+        worker.remote_region_labels[remote_engine_id] = {
+            rank: ["layer.0"] for rank in range(remote_tp_size)
+        }
+        worker.dst_xfer_side_handles[remote_engine_id] = {
+            rank: 200 + rank for rank in range(remote_tp_size)
+        }
+        worker._remote_agents[remote_engine_id] = {
+            rank: f"agent-{rank}" for rank in range(remote_tp_size)
+        }
+
+        reads: list[int] = []
+
+        def fake_read_blocks(**kwargs):
+            reads.append(kwargs["remote_rank"])
+
+        sent_notifs: list[tuple[str, bytes]] = []
+
+        def fake_send_notif(agent_name: str, notif_msg: bytes) -> None:
+            sent_notifs.append((agent_name, notif_msg))
+
+        worker._read_blocks = fake_read_blocks  # type: ignore[method-assign]
+        worker.nixl_wrapper.send_notif = fake_send_notif  # type: ignore[method-assign]
+
+        remote_request_id = "prefill-chatcmpl-123"
+        meta = NixlConnectorMetadata()._add_new_req(
+            local_block_ids=([1, 2, 3],),
+            kv_transfer_params={"tp_size": remote_tp_size, "pp_size": 1},
+        )
+        meta.remote = RemoteMeta(
+            block_ids=([4, 5, 6],),
+            engine_id=remote_engine_id,
+            request_id=remote_request_id,
+            host="localhost",
+            port=1234,
+        )
+
+        worker._read_blocks_for_req("decode-chatcmpl-456", meta)
+
+        assert reads == [0]
+        assert sent_notifs == [
+            (f"agent-{rank}", f"{remote_request_id}:1".encode())
+            for rank in range(1, remote_tp_size)
+        ]
 
     @patch(
         "vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker.NixlWrapper",
