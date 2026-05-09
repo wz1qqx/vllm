@@ -179,6 +179,22 @@ class OpenAIServingChat(OpenAIServing):
         self.supports_code_interpreter = False
         self.python_tool = None
 
+    @staticmethod
+    def _resolve_streaming_chat_completion_finish_reason(
+        output_finish_reason: str | None,
+        tool_calls_finished: bool,
+    ) -> str:
+        """Resolve the public streaming chat finish_reason.
+
+        Non-stop engine finish reasons (for example "length") describe why
+        generation ended and must not be hidden by tool-call formatting.
+        """
+        if output_finish_reason and output_finish_reason != "stop":
+            return output_finish_reason
+        if tool_calls_finished:
+            return "tool_calls"
+        return output_finish_reason or "stop"
+
     def warmup(self) -> None:
         self.renderer.warmup(
             ChatParams(
@@ -1253,16 +1269,16 @@ class OpenAIServingChat(OpenAIServing):
                         # finish_reason is:
                         # "tool_calls" for "auto" or "required" tool calls,
                         # and "stop" for named tool calls.
-                        if (
+                        tool_calls_finished = (
                             auto_tools_called
                             or (tools_streamed[i] and not tool_choice_function_name)
                             or (self.use_harmony and harmony_tools_streamed[i])
-                        ):
-                            finish_reason_ = "tool_calls"
-                        else:
-                            finish_reason_ = (
-                                output.finish_reason if output.finish_reason else "stop"
+                        )
+                        finish_reason_ = (
+                            self._resolve_streaming_chat_completion_finish_reason(
+                                output.finish_reason, tool_calls_finished
                             )
+                        )
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=i,
                             delta=delta_message,

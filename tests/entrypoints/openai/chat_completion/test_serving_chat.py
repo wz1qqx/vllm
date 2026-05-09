@@ -624,6 +624,32 @@ def test_async_serving_chat_init():
     assert serving_completion.chat_template == CHAT_TEMPLATE
 
 
+@pytest.mark.parametrize(
+    ("output_finish_reason", "tool_calls_finished", "expected"),
+    [
+        (None, False, "stop"),
+        (None, True, "tool_calls"),
+        ("stop", False, "stop"),
+        ("stop", True, "tool_calls"),
+        ("length", False, "length"),
+        ("length", True, "length"),
+        ("abort", True, "abort"),
+        ("repetition", True, "repetition"),
+    ],
+)
+def test_resolve_streaming_chat_completion_finish_reason(
+    output_finish_reason: str | None,
+    tool_calls_finished: bool,
+    expected: str,
+):
+    assert (
+        OpenAIServingChat._resolve_streaming_chat_completion_finish_reason(
+            output_finish_reason, tool_calls_finished
+        )
+        == expected
+    )
+
+
 @pytest.mark.asyncio
 async def test_serving_chat_returns_correct_model_name():
     mock_engine = MagicMock(spec=AsyncLLM)
@@ -1779,11 +1805,34 @@ async def test_tool_choice_validation_without_parser():
     assert "--tool-call-parser" in response_named.error.message
 
 
-@pytest.mark.asyncio
-async def test_streaming_n_gt1_independent_tool_parsers():
-    """n>1 streaming must use independent parser instances
-    and token-id histories per choice.
-    """
+async def _collect_streaming_chunks(
+    serving_chat: OpenAIServingChat,
+    request: ChatCompletionRequest,
+    result_generator,
+    tokenizer,
+) -> list[dict[str, Any]]:
+    chunks: list[dict[str, Any]] = []
+    async for chunk_str in serving_chat.chat_completion_stream_generator(
+        request=request,
+        result_generator=result_generator,
+        request_id="test-req",
+        model_name=MODEL_NAME,
+        conversation=[],
+        tokenizer=tokenizer,
+        request_metadata=RequestResponseMetadata(
+            request_id="test-req",
+            model_name=MODEL_NAME,
+        ),
+    ):
+        if not chunk_str.strip() or "data: [DONE]" in chunk_str:
+            continue
+        if chunk_str.startswith("data: "):
+            chunks.append(json.loads(chunk_str[6:].strip()))
+    return chunks
+
+
+def _build_streaming_tool_call_serving_chat() -> OpenAIServingChat:
+    """Build a serving chat instance with Hermes auto tool parsing enabled."""
     mock_engine = MagicMock(spec=AsyncLLM)
     mock_engine.errored = False
     mock_engine.model_config = MockModelConfig()
@@ -1807,23 +1856,34 @@ async def test_streaming_n_gt1_independent_tool_parsers():
         enable_auto_tools=True,
         tool_parser="hermes",
     )
+    return serving_chat
+
+
+def _streaming_weather_tool() -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_streaming_n_gt1_independent_tool_parsers():
+    """n>1 streaming must use independent parser instances
+    and token-id histories per choice.
+    """
+    serving_chat = _build_streaming_tool_call_serving_chat()
 
     tokenizer = get_tokenizer(MODEL_NAME)
 
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "get_weather",
-                "description": "Get weather",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"city": {"type": "string"}},
-                    "required": ["city"],
-                },
-            },
-        }
-    ]
+    tools = [_streaming_weather_tool()]
 
     num_choices = 2
 
@@ -1892,33 +1952,30 @@ async def test_streaming_n_gt1_independent_tool_parsers():
             finished=True,
         )
 
+    chunks = await _collect_streaming_chunks(
+        serving_chat,
+        request,
+        result_generator(),
+        tokenizer,
+    )
+
     # Collect tool-call deltas per choice from the SSE stream.
     tc_deltas_by_choice: dict[int, list[dict]] = {i: [] for i in range(num_choices)}
-    async for chunk_str in serving_chat.chat_completion_stream_generator(
-        request=request,
-        result_generator=result_generator(),
-        request_id="test-req",
-        model_name=MODEL_NAME,
-        conversation=[],
-        tokenizer=tokenizer,
-        request_metadata=RequestResponseMetadata(
-            request_id="test-req",
-            model_name=MODEL_NAME,
-        ),
-    ):
-        if not chunk_str.strip() or "data: [DONE]" in chunk_str:
-            continue
-        if chunk_str.startswith("data: "):
-            data = json.loads(chunk_str[6:].strip())
-            for choice in data.get("choices", []):
-                idx = choice["index"]
-                delta = choice.get("delta", {})
-                if delta.get("tool_calls"):
-                    for tc in delta["tool_calls"]:
-                        tc_deltas_by_choice[idx].append(tc)
+    finish_reasons_by_choice: dict[int, str] = {}
+    for data in chunks:
+        for choice in data.get("choices", []):
+            idx = choice["index"]
+            if choice.get("finish_reason") is not None:
+                finish_reasons_by_choice[idx] = choice["finish_reason"]
+            delta = choice.get("delta", {})
+            if delta.get("tool_calls"):
+                for tc in delta["tool_calls"]:
+                    tc_deltas_by_choice[idx].append(tc)
 
     # Both choices must independently produce the correct tool call.
     for choice_idx in range(num_choices):
+        assert finish_reasons_by_choice[choice_idx] == "tool_calls"
+
         deltas = tc_deltas_by_choice[choice_idx]
         assert len(deltas) > 0, (
             f"Choice {choice_idx}: expected tool-call deltas but got none"
@@ -1940,6 +1997,74 @@ async def test_streaming_n_gt1_independent_tool_parsers():
         assert parsed_args == {"city": "Tokyo"}, (
             f"Choice {choice_idx}: expected {{'city': 'Tokyo'}}, got {parsed_args}"
         )
+
+
+@pytest.mark.asyncio
+async def test_streaming_tool_call_length_finish_reason_is_preserved():
+    serving_chat = _build_streaming_tool_call_serving_chat()
+    tokenizer = get_tokenizer(MODEL_NAME)
+
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "test"}],
+        stream=True,
+        tools=[_streaming_weather_tool()],
+        tool_choice="auto",
+    )
+
+    async def result_generator():
+        yield RequestOutput(
+            request_id="test-req",
+            prompt="test",
+            prompt_token_ids=[1, 2, 3],
+            prompt_logprobs=None,
+            outputs=[
+                CompletionOutput(
+                    index=0,
+                    text=(
+                        '<tool_call>{"name": "get_weather", '
+                        '"arguments": {"city": "Tok'
+                    ),
+                    token_ids=[10],
+                    cumulative_logprob=0.0,
+                    logprobs=None,
+                )
+            ],
+            finished=False,
+        )
+        yield RequestOutput(
+            request_id="test-req",
+            prompt="test",
+            prompt_token_ids=[1, 2, 3],
+            prompt_logprobs=None,
+            outputs=[
+                CompletionOutput(
+                    index=0,
+                    text="",
+                    token_ids=[],
+                    cumulative_logprob=0.0,
+                    logprobs=None,
+                    finish_reason="length",
+                )
+            ],
+            finished=True,
+        )
+
+    chunks = await _collect_streaming_chunks(
+        serving_chat,
+        request,
+        result_generator(),
+        tokenizer,
+    )
+
+    choices = [
+        choice
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+        if choice.get("finish_reason") is not None
+    ]
+    assert len(choices) == 1
+    assert choices[0]["finish_reason"] == "length"
 
 
 class TestCreateRemainingArgsDelta:
