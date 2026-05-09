@@ -315,6 +315,127 @@ class TestStreamingHappyPath:
         assert rec.tool_calls[0].function.name == "get_weather"
         assert json.loads(rec.tool_calls[0].function.arguments) == {"city": "Beijing"}
 
+    def test_array_arguments_tail_emitted_on_tool_close(self, parser):
+        """
+        Regression for streaming + MTP style chunks where the final tool-call
+        delta closes an array argument and the tool section together.
+        """
+        first_args = (
+            '{"queries": ["转录组学机制调控 2025 2026", '
+            '"transcriptomics regulatory mechanisms review'
+        )
+        final_args = '", "表观遗传调控 转录组学"]}'
+        deltas = [
+            SECTION_BEGIN,
+            TOOL_BEGIN,
+            "functions.web_search:0 ",
+            ARG_BEGIN,
+            first_args,
+            final_args + TOOL_END + SECTION_END,
+        ]
+        rec = run_tool_extraction_streaming(parser, deltas)
+
+        assert len(rec.tool_calls) == 1
+        assert rec.tool_calls[0].id == "functions.web_search:0"
+        assert rec.tool_calls[0].function.name == "web_search"
+        assert rec.tool_calls[0].function.arguments == first_args + final_args
+        assert json.loads(rec.tool_calls[0].function.arguments) == {
+            "queries": [
+                "转录组学机制调控 2025 2026",
+                "transcriptomics regulatory mechanisms review",
+                "表观遗传调控 转录组学",
+            ]
+        }
+
+    def test_complete_array_tool_call_single_chunk(self, parser):
+        """
+        Spec decode can return several accepted tokens in one engine iteration.
+        A complete tool call in one chunk must stream both name and arguments.
+        """
+        args = (
+            '{"queries": ["转录组学机制调控 2025 2026", '
+            '"transcriptomics regulatory mechanisms review", '
+            '"表观遗传调控 转录组学"]}'
+        )
+        deltas = [
+            SECTION_BEGIN,
+            (
+                TOOL_BEGIN
+                + "functions.web_search:0 "
+                + ARG_BEGIN
+                + args
+                + TOOL_END
+                + SECTION_END
+            ),
+        ]
+        rec = run_tool_extraction_streaming(
+            parser, deltas, assert_one_tool_per_delta=False
+        )
+
+        assert len(rec.tool_calls) == 1
+        assert rec.tool_calls[0].id == "functions.web_search:0"
+        assert rec.tool_calls[0].function.name == "web_search"
+        assert rec.tool_calls[0].function.arguments == args
+        assert json.loads(rec.tool_calls[0].function.arguments)["queries"][-1] == (
+            "表观遗传调控 转录组学"
+        )
+
+    def test_second_complete_tool_call_single_chunk(self, parser):
+        """
+        The single-chunk start/end case can happen after another tool call has
+        already been streamed. The parser must advance to the next tool index.
+        """
+        first_args = '{"queries": ["transcriptomics"]}'
+        second_args = '{"queries": ["表观遗传调控 转录组学"]}'
+        deltas = [
+            SECTION_BEGIN,
+            (
+                TOOL_BEGIN
+                + "functions.web_search:0 "
+                + ARG_BEGIN
+                + first_args
+                + TOOL_END
+            ),
+            (
+                TOOL_BEGIN
+                + "functions.web_search:1 "
+                + ARG_BEGIN
+                + second_args
+                + TOOL_END
+                + SECTION_END
+            ),
+        ]
+        rec = run_tool_extraction_streaming(
+            parser, deltas, assert_one_tool_per_delta=False
+        )
+
+        assert len(rec.tool_calls) == 2
+        assert rec.tool_calls[0].id == "functions.web_search:0"
+        assert rec.tool_calls[0].function.arguments == first_args
+        assert rec.tool_calls[1].id == "functions.web_search:1"
+        assert rec.tool_calls[1].function.name == "web_search"
+        assert rec.tool_calls[1].function.arguments == second_args
+
+    def test_section_end_not_streamed_as_partial_arguments(self, parser):
+        """
+        If generation stops with a section end before a tool_call_end marker,
+        the section marker must not be appended to historical arguments.
+        """
+        deltas = [
+            SECTION_BEGIN,
+            TOOL_BEGIN,
+            "functions.web_search:0 ",
+            ARG_BEGIN,
+            '{"queries": ["incomplete"',
+            SECTION_END,
+        ]
+        rec = run_tool_extraction_streaming(parser, deltas)
+
+        assert len(rec.tool_calls) == 1
+        assert rec.tool_calls[0].function.name == "web_search"
+        assert rec.tool_calls[0].function.arguments == '{"queries": ["incomplete"'
+        assert SECTION_END not in rec.tool_calls[0].function.arguments
+
     @pytest.mark.parametrize(
         "model_output",
         [

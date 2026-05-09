@@ -41,6 +41,7 @@ class KimiK2ToolParser(ToolParser):
 
         # Section marker
         self.tool_calls_start_token: str = "<|tool_calls_section_begin|>"
+        self.tool_calls_end_token: str = "<|tool_calls_section_end|>"
 
         # Individual tool call markers
         self.tool_call_start_token: str = "<|tool_call_begin|>"
@@ -210,12 +211,14 @@ class KimiK2ToolParser(ToolParser):
                 break
             tc_start = start + len(self.tool_call_start_token)
             end = current_text.find(self.tool_call_end_token, tc_start)
+            section_end = current_text.find(self.tool_calls_end_token, tc_start)
 
             if end != -1:
                 tool_call = current_text[tc_start:end]
                 pos = end + len(self.tool_call_end_token)
             else:
-                tool_call = current_text[tc_start:]
+                call_end = section_end if section_end != -1 else len(current_text)
+                tool_call = current_text[tc_start:call_end]
                 overlap = partial_tag_overlap(tool_call, self.tool_call_end_token)
                 if overlap:
                     tool_call = tool_call[:-overlap]
